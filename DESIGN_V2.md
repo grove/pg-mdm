@@ -4,7 +4,7 @@
 
 **Status:** Proposed roadmap after the first open-source release  
 **Baseline:** [`DESIGN_V1.md`](DESIGN_V1.md)  
-**Foundation:** [`pg_trickle`](https://github.com/trickle-labs/pg-trickle) remains the incremental relational substrate  
+**Foundation:** [`pg_trickle`](https://github.com/trickle-labs/pg-trickle) remains the incremental relational engine
 **Goal:** Add deeper source, matching, stewardship, history, integration, and operational capabilities without changing the small product model established by V1  
 **Product contract:** The same five nouns, five actions, and three primary public outputs
 
@@ -20,7 +20,7 @@ The architectural rule from V1 does not change:
 
 > **`pg_trickle` maintains changing relational facts; `pg_mdm` decides identity.**
 
-V2 deepens both sides of that boundary. `pg_trickle` may provide prepared graph generations, richer source frontiers, durable delta leases, dependency scheduling, and resumable relational work. `pg_mdm` may provide richer source contracts, alternate conservative clustering policies, entity-level stewardship, stable-ID continuity policies, valid-time projections, semantic events, and multi-entity orchestration. Neither extension is allowed to take over the other extension's governance. `pg_mdm` never reaches into private `pg_trickle` catalogs or buffers, and custom matching code never owns clustering, identity reconciliation, invalidation, or publication.
+V2 deepens both sides of that boundary. The `prepared_graph_generation` capability lets `pg_trickle` freeze one externally orchestrated graph in place with durable member leases, while the optional `prepared_output_delta_binding` capability pins terminal delta ranges. `pg_mdm` may provide richer source contracts, alternate conservative clustering policies, entity-level stewardship, stable-ID continuity policies, valid-time projections, semantic events, checkpointed domain work, and multi-entity orchestration. `pg_trickle` does not make its graph refresh resumable and does not manage MDM workers or checkpoints. Neither extension is allowed to take over the other extension's governance. `pg_mdm` never reaches into private `pg_trickle` catalogs or buffers, and custom matching code never owns clustering, identity reconciliation, invalidation, or publication.
 
 V2 is a roadmap rather than a promise that every section ships in one release. Each capability must have a clear user need, deterministic semantics, a bounded explanation, a safe migration path, and tests showing that it composes with incremental maintenance and atomic publication. A smaller V2 release that solves demonstrated problems is preferable to implementing the whole roadmap speculatively.
 
@@ -32,7 +32,7 @@ V2 is where the system may become suitable for larger organizations, more varied
 
 | Area | V1 baseline | V2 direction |
 |---|---|---|
-| Source ingestion | Local tracked, soft-delete, and complete-snapshot relations | Ordered change feeds, external snapshot providers, richer lifecycle states, schema contracts, replay horizons, and distributed-source proofs |
+| Source ingestion | Local tracked and soft-delete tables | Complete snapshots, ordered change feeds, external providers, richer lifecycle states, schema contracts, replay horizons, and distributed-source proofs |
 | Time | Current state at an immutable publication revision | Effective time, late corrections, source-version history, and explicitly qualified point-in-time projections |
 | Configuration | One optional built-in preset with entity-local overrides | Versioned organization fragments, nested canonical composition, per-path provenance, inference, and regression fixtures |
 | Matching | Built-in cleaners, comparators, and complete candidate channels | Registered custom functions, declared lookup relations, expert candidate keys, additional evidence models, and richer diagnostics |
@@ -40,10 +40,10 @@ V2 is where the system may become suitable for larger organizations, more varied
 | Stewardship | Pair `MATCH`, pair `NOT_MATCH`, and anchored golden override | Merge, split, move-member, locks, scoped invariant overrides, approvals, assignment, and bounded bulk action |
 | Stable identity | One merge and split continuity policy | Weighted continuity, canonical-ID locks, durable anchors, and planned identity migrations |
 | Downstream use | Ordinary SQL and ordinary PostgreSQL CDC | Semantic change feed, revision-bound entity dependencies, retained lineage, and optional external delivery |
-| Execution | One synchronous outer transaction with full-entity MDM resolution | Proven affected-set resolution and optional prepared, checkpointed, resumable runs with an atomic final promotion |
+| Execution | One synchronous outer transaction with full-entity MDM resolution | Proven affected-set resolution and optional one-transaction evidence preparation followed by checkpointed MDM resolution and atomic promotion |
 | Operations | One administrative scope using PostgreSQL controls | Namespaces, quotas, fairness, service objectives, restore verification, retention policies, and deeper health diagnostics |
 
-Optional capabilities compose through an explicit dependency graph. Each entity manifest pins every enabled capability and version, and the compiler rejects missing, disabled, or incompatible prerequisites before source work begins. For example, prepared execution requires the corresponding `pg_trickle` generation and promotion contract; valid-time projections require retained source versions and a historical identity mode; and resolved entities as sources require the semantic-feed replay, retention, and resynchronization contract. `mdm.describe()` reports the enabled capabilities, their prerequisites, and any capability for which the entity is ineligible. An optional capability may be unavailable; it may not silently degrade into a weaker result.
+Optional capabilities compose through an explicit dependency graph. Each entity manifest pins every enabled capability and version, and the compiler rejects missing, disabled, or incompatible prerequisites before source work begins. `prepared_graph_generation` major 1 requires `external_graph_refresh` major 1. `prepared_output_delta_binding` major 1 separately requires `prepared_graph_generation` major 1 and `output_delta_consumer` major 1. Valid-time projections require retained source versions and a historical identity mode, and resolved entities as sources require the semantic-feed replay, retention, and resynchronization contract. `mdm.describe()` reports the enabled capabilities, their prerequisites, and any capability for which the entity is ineligible. An optional capability may be unavailable; it may not silently degrade into a weaker result.
 
 No V2 feature may weaken the V1 fail-closed rules. A richer source adapter cannot turn an unproven watermark into completeness. A custom candidate generator cannot use truncation as proof of non-match. A bulk stewardship action cannot accept an incompletely evaluated population. A workload budget cannot lower a match threshold. More capability means more explicit contracts, not more opportunities to guess.
 
@@ -53,13 +53,13 @@ No V2 feature may weaken the V1 fail-closed rules. A richer source adapter canno
 
 The V1 implementation compiles each immutable entity definition into a private `pg_trickle` graph and refreshes that graph inside the same transaction that resolves and publishes the MDM entity. V2 keeps that path as the default for small and medium entities because it is simple and has a strong atomicity story. V2 adds a prepared execution path for entities whose evidence graph or clustering work cannot reasonably fit in one transaction, but the prepared path is optional and must preserve the same semantic result.
 
-V2 may also optimize the transactional path with affected-set MDM resolution. The full resolver remains the reference semantics. An affected-set implementation must consume a complete durable terminal delta, define and prove its closure rule, fall back to full resolution whenever completeness is uncertain, and pass generated equivalence tests for evidence changes, merges, splits, and stewardship decisions before it can publish results.
+Later V2 releases may optimize the transactional path with affected-set MDM resolution. The full resolver remains the reference semantics. An affected-set implementation requires `output_delta_consumer`, must consume every typed batch or respond to `FULL_INVALIDATION` with full resolution, define and prove its closure rule, and pass generated equivalence tests for evidence changes, merges, splits, and stewardship decisions before it can publish results. Durable terminal deltas are not a prerequisite for prepared full resolution.
 
-The extension-to-extension boundary remains a versioned SQL contract. V2 may require `pg_trickle` to expose capabilities such as strict graph refresh, immutable prepared graph generations, durable terminal-delta consumers, source-boundary manifests, safe promotion and abandonment, graph-specification export, and capability negotiation. The concrete SQL names can evolve before release, but the behaviors are normative. `pg_mdm` must be able to discover which capabilities are present, pin their contract versions in the entity manifest, and reject an unsupported combination before source work begins.
+The extension-to-extension boundary remains a versioned SQL contract. `pg_mdm` discovers `prepared_graph_generation` and, when used, `prepared_output_delta_binding` through `pgtrickle.integration_capabilities()`. It pins supported capability majors and minimum minors in the entity manifest and rejects an absent, disabled, or incompatible combination before source work begins. It uses only the public preparation, opening, inspection, verification, promotion, abandonment, and optional consumer-binding operations.
 
-A prepared graph generation is a complete private evidence state associated with one immutable definition, one execution role, one source-boundary manifest, one set of stream-table specification digests, and one `pg_trickle` row-identity and semantic-plan version. Once `pg_trickle` hands that generation to `pg_mdm`, it cannot be mutated in place. Later source changes remain pending for another generation. The prepared state is not visible through the three public MDM outputs, and it does not become the active private graph merely because its computation completed.
+A prepared graph generation is a complete private evidence state associated with one immutable definition, one execution role, one source-boundary manifest, one graph digest, pinned member contracts and content epochs, and the applicable `pg_trickle` row-identity and probe versions. `pgtrickle.prepare_graph()` performs one ordinary strict graph refresh in the caller's transaction, then freezes the current stream-table storage in place with one durable lease per member. Capability major 1 does not clone storage or permit overlapping prepared generations. Later source changes remain pending until the lease is released. The prepared rows are already in the private stream tables, but `PREPARED` means that `pg_mdm` has not accepted them as a public identity result.
 
-Promotion is the critical boundary. The final `pg_mdm` publication transaction verifies the prepared generation, publishes memberships, goldens, reviews, provenance, semantic events, and identity history, and calls the supported `pg_trickle` promotion or acknowledgment primitive in the same transaction. Either the prepared evidence state and MDM publication become active together, or neither does. Abandoned generations can be garbage-collected only after `pg_mdm` has durably marked them superseded or failed.
+Promotion is the critical boundary. The final `pg_mdm` publication transaction verifies its compare-and-swap conditions, publishes memberships, goldens, reviews, provenance, semantic events, and identity history, and calls `pgtrickle.promote_prepared_graph()` with the expected generation digest. Promotion records acceptance and releases member leases in the same transaction. With prepared delta binding it also applies the exact required acknowledgements. A rollback leaves the generation `PREPARED`, leases active, consumer cursors unchanged, and the old MDM publication complete. A superseded or failed run calls `pgtrickle.abandon_prepared_graph()` with a reason; abandonment releases leases without acknowledging deltas or reversing the private graph.
 
 The richer integration contract also permits `pg_trickle` to maintain relational facts that are not direct source projections. Examples include source-version tables, deterministic lookup joins, candidate-frequency statistics, valid-time interval projections, and downstream MDM dependency inputs. These are still relational facts. The final decisions about pair classification, component admission, manual precedence, stable identity, review state, and publication remain in `pg_mdm`.
 
@@ -67,47 +67,55 @@ The richer integration contract also permits `pg_trickle` to maintain relational
 
 ## 4. Prepared and resumable refresh
 
-V2 may add a resumable refresh mode for entities that exceed the practical transaction duration, memory, temporary-storage, or lock envelope of V1. Resumability is not implemented by committing partial public results. It is implemented by computing against an immutable prepared evidence generation, checkpointing deterministic private work, and performing one short final publication transaction after the complete result has been validated.
+V2's prepared profile makes MDM resolution resumable for entities that exceed the practical transaction duration, memory, temporary-storage, or lock envelope of V1. It does not make the `pg_trickle` graph refresh resumable. `pgtrickle.prepare_graph()` must still complete one strict graph refresh in one PostgreSQL transaction. If relational evidence construction cannot fit that envelope, the entity is ineligible for this capability major and needs a later graph-execution design.
 
-A resumable run has an immutable manifest and a small state machine:
+The preparation transaction uses a durable MDM run ID as `request_id`, calls `prepare_graph()` with the private roots and expected graph digest, and stores the returned `prepared_generation_id`, `generation_digest`, graph refresh ID, source boundary, member contracts, and optional consumer bindings in the run manifest. The generation and MDM run record commit together. Request identity makes a retry after an uncertain connection result idempotent.
+
+The MDM run state remains:
 
 ```text
 planned
-  → preparing_evidence
-  → evidence_ready
-  → resolving
-  → validating
-  → ready_to_publish
-  → published
+    → preparing_evidence
+    → evidence_ready
+    → resolving
+    → validating
+    → ready_to_publish
+    → published
 
 Any pre-publication state may instead become superseded, failed, or abandoned.
 ```
 
-The manifest pins the entity definition, active publication revision, stewardship decision epoch, source contracts, source boundaries, private graph specifications, semantic engine versions, identity ledger digest, and every mutable dependency needed by custom code. Source changes committed after the prepared boundary do not invalidate the run; they remain pending for a later refresh. A changed desired definition, a new stewardship directive, a changed lock, an incompatible function dependency, or a replaced base publication normally supersedes the run because the proposed identity result no longer corresponds to the current control state.
+`evidence_ready` corresponds to a `pg_trickle` generation in `PREPARED`. The `pg_trickle` state machine is separate and smaller: `PREPARED` transitions to `PROMOTED` or `ABANDONED`; integrity loss changes it to `INVALID`, which can only be abandoned. An old generation never expires, promotes, or abandons itself.
+
+The manifest also pins the entity definition, active publication revision, stewardship decision epoch, source contracts, semantic engine versions, identity-ledger digest, and every mutable dependency needed by custom code. Source changes committed after the prepared boundary do not invalidate the run; they remain pending for a later graph refresh. A changed desired definition, new stewardship directive, changed lock, incompatible function dependency, or replaced base publication normally supersedes the MDM run even when the prepared evidence remains valid.
+
+Every processing transaction calls `pgtrickle.open_prepared_graph(prepared_generation_id, expected_generation_digest)` before reading member or bound delta relations. The call validates the generation and takes a transaction-scoped shared transition lock. Durable member leases prevent graph mutation between transactions; the shared lock prevents promotion or abandonment during a read. `pg_mdm` never reads a prepared generation without opening it.
 
 Resolution work is divided into deterministic ranges such as canonical source-record intervals, candidate-block intervals, component roots, or stable run-local component identifiers. A checkpoint records only completed work whose inputs are named by the run manifest and whose outputs are stored in run-scoped logged tables. Replaying a completed range is a no-op, and worker order cannot affect edge ordering, component decisions, or stable-ID reconciliation. If a work range cannot be made idempotent and independently verifiable, it is not eligible for checkpointing and must be recomputed.
 
-Multiple workers may claim ranges with leases, but a lease is an operational mechanism rather than a semantic input. A crashed worker's lease expires, and another worker repeats or verifies the range. The number of workers, batching, query plans, and physical indexes may change performance but not the logical result. Resource limits may pause a run, reduce concurrency, or force a broader recomputation; they may not omit candidates, weaken a component condition, or publish a partial entity.
+Multiple MDM workers may claim ranges with coordinator-owned leases, but those leases only allocate work. `pg_trickle` separately owns one durable lease for every prepared graph member, and those leases provide evidence isolation. A crashed worker's range lease expires, and another worker repeats or verifies the range. The number of workers, batching, query plans, and physical indexes may change performance but not the logical result.
 
-The final publication transaction performs a compare-and-swap against the manifest. It verifies that the active publication revision and decision epoch are unchanged, that the desired definition still permits this run to activate, that every prepared graph token and custom dependency is valid, and that all run invariants passed. It then applies the logical row diffs to the three primary outputs, writes semantic change events and retained history, promotes the prepared graph generation, advances the publication revision, and commits. If any verification fails, the old publication remains complete and the run becomes superseded or failed.
+Before publication, `pg_mdm` may call `pgtrickle.verify_prepared_graph()` to distinguish prepared validity from future refresh continuity. The final publication transaction performs the MDM compare-and-swap, applies logical row changes and required history, and calls `pgtrickle.promote_prepared_graph()` with the exact generation digest and, when enabled, one required acknowledgement per prepared consumer binding. If any statement or the transaction fails, the old publication remains complete and the generation remains `PREPARED` for retry or abandonment.
 
-A deployment does not have to enable resumable execution. The V1 single-transaction path remains the simplest and strongest default. `mdm.describe()` reports which execution profiles are supported and why a particular entity is eligible or ineligible for the prepared path.
+Abandonment is explicit. A superseded or failed run records its reason and calls `pgtrickle.abandon_prepared_graph()` in the same transaction. The call releases member leases but does not acknowledge output deltas and does not roll private stream tables back to their prior contents. A later run consumes the cumulative delta since the last promoted publication or performs a full resynchronization.
+
+A deployment does not have to enable prepared execution. The V1 single-transaction path remains the simplest and strongest default. `mdm.describe()` reports capability versions, generation state, prepared age, future continuity, pending source growth, and why a particular entity is eligible or ineligible for the prepared profile.
 
 ---
 
 ## 5. Full source contracts
 
-V1 source modes are intentionally small presets. V2 may generalize them into a complete source contract when a deployment needs ordered events, replay, changing row scope, external snapshot tokens, late correction, or lifecycle states beyond active and inactive. The contract is compiled into ordinary private graph inputs and `pg_trickle` source capabilities; it is not a second ingestion engine inside `pg_mdm`.
+V1 source modes are intentionally small presets. V2 may generalize them into a complete source contract when a deployment needs complete snapshots, ordered events, replay, changing row scope, external snapshot tokens, late correction, or lifecycle states beyond active and inactive. The contract is compiled into ordinary private graph inputs and `pg_trickle` source capabilities; it is not a second ingestion engine inside `pg_mdm`.
 
 A full source contract describes the identity and scope of source records, the mechanism that proves change completeness, and the interpretation of source versions. It may declare the stable-key columns and key-reuse policy, source row scope and filter semantics, schema and collation requirements, lifecycle field, event or snapshot identity, source sequence, event ID, effective interval, observed time, completeness watermark, duplicate handling, correction behavior, replay horizon, and the `pg_trickle` adapter or locally materialized landing relation that supplies the data.
 
-The V1 modes become named presets for this larger model:
+The V1 modes remain named presets in this larger model, while snapshot becomes a V2 contract that requires a `pg_trickle` capability able to prove its boundary:
 
-| V1 mode | V2 source-contract interpretation |
-|---|---|
-| `tracked` | A current local relation with exact `pg_trickle` change capture and explicit hard deletes |
-| `soft_delete` | A tracked current relation with a retained lifecycle predicate in addition to hard-delete capture |
-| `snapshot` | A complete replacement relation with a snapshot identifier that proves the scanned row scope is complete |
+| Mode | Source-contract interpretation | Release boundary |
+|---|---|---|
+| `tracked` | A current local relation with exact `pg_trickle` change capture and explicit hard deletes | V1 |
+| `soft_delete` | A tracked current relation with a retained lifecycle predicate in addition to hard-delete capture | V1 |
+| `snapshot` | A complete replacement relation with a snapshot identifier that proves the scanned row scope is complete | V2 |
 
 V2 may additionally support an `ordered_changes` contract. This contract consumes an append-only or update-safe local landing relation whose rows contain a stable event ID, source-record key and incarnation, a source sequence that totally orders events for that record, lifecycle action, payload or changed fields, and a completeness watermark. A global order across independent records is not required. Events for one source-record incarnation that cannot be totally ordered are rejected; arrival order and timestamps are not tie breaks. The watermark means that every event in the declared source scope through that boundary has been delivered; it is not merely the greatest timestamp seen. Duplicate delivery is a no-op, and a correction explicitly names the source event or source version it supersedes.
 
@@ -162,7 +170,7 @@ exact_entity
 unknown
 ```
 
-A full exact preview creates or reuses an isolated shadow graph generation, resolves the complete requested source boundary, and compares the result with the active publication without promoting it. It reports exact pair, merge, split, stable-ID, golden, review, output-schema, semantic-event, storage, and execution effects. For large entities it may use the prepared and resumable execution path, but its final output remains isolated and expires according to preview retention policy.
+A full exact preview creates or reuses a separate private graph for the proposed definition, resolves the complete requested source boundary, and compares the result with the active publication without publishing it. For large entities it may prepare that graph and use checkpointed MDM resolution, but `prepared_graph_generation` major 1 still permits only one active prepared lease per stream-table member and does not clone member storage. The preview reports exact pair, merge, split, stable-ID, golden, review, output-schema, semantic-event, storage, and execution effects, and its MDM-owned results expire according to preview retention policy.
 
 V2 may add labeled pair, entity, and golden fixtures. A pair fixture records expected evidence or pair classification for named source records. An entity fixture records an expected partition, forbidden co-memberships, required anchors, or expected stable-ID outcome. A golden fixture records the expected selected value, provenance class, or conflict. Fixtures run against proposed definitions and engine upgrades, but they do not become live stewardship decisions unless a user explicitly records a corresponding directive.
 
@@ -349,7 +357,7 @@ source-contract versions and source schema fingerprints
 source snapshot, event, or frontier boundaries
 upstream MDM publication revisions
 source-record version references and retained payload digests
-private pg_trickle graph specifications and prepared-generation identifiers
+private pg_trickle graph specifications, prepared_generation_id, and generation_digest
 pg_trickle integration, row-identity, planner, and semantic-plan versions
 cleaner, comparator, candidate, component, clustering, stable-ID, and golden policy versions
 registered function signatures, fingerprints, tests, and declared dependencies
@@ -457,7 +465,7 @@ The order below reflects technical dependencies rather than a requirement to shi
 
 ### 23.1 Reproducibility and prepared execution
 
-First add richer manifests, exact `pg_trickle` capability negotiation, immutable prepared graph generations, and atomic promotion. These foundations make large exact preview, resumable refresh, and later operational features possible without weakening publication semantics. Durable terminal deltas and their leases are not prerequisites for prepared full resolution; add them only with affected-set resolution after measurements justify that optimization.
+First add richer manifests and exact `pg_trickle` capability negotiation. Then integrate `prepared_graph_generation` major 1 through `prepare_graph()`, mandatory prepared opening, verification, atomic promotion, and explicit abandonment. These foundations make large exact preview and checkpointed MDM resolution possible without implying resumable graph refresh or multiple physical generations. `prepared_output_delta_binding` and `output_delta_consumer` are not prerequisites for prepared full resolution; add them only with affected-set resolution after measurements justify that optimization.
 
 ### 23.2 Source depth and time
 
@@ -512,8 +520,8 @@ This table summarizes where the release boundary now sits.
 | Area | V1 contract | V2 addition |
 |---|---|---|
 | Product model | Five nouns, five actions, three primary outputs | No change |
-| `pg_trickle` integration | Strict transactional private-graph refresh | Durable terminal deltas, prepared generations, durable leases, promotion, resumability, richer capability negotiation |
-| Sources | Local tracked, soft-delete, and complete snapshot | Full contracts, ordered events, external adapters, lifecycle states, row scope, schema and replay policy |
+| `pg_trickle` integration | `external_graph_refresh` major 1 with strict transactional private-graph refresh | `prepared_graph_generation` for freeze-in-place leases and atomic promotion; optional `output_delta_consumer` and `prepared_output_delta_binding` for affected-set work |
+| Sources | Local tracked and soft-delete tables | Complete snapshots, full contracts, ordered events, external adapters, lifecycle states, row scope, schema and replay policy |
 | Time | Immutable publication revisions | Effective time, observed time, late corrections, point-in-time projections |
 | Configuration | One optional built-in preset with entity-local overrides | Organization fragments, nested canonical expansion, per-path provenance |
 | Verification | Validation, diagnostic sampling, exact named subjects | Full exact preview, labeled fixtures, metrics, inference, stewardship impact |
@@ -526,7 +534,7 @@ This table summarizes where the release boundary now sits.
 | Outputs | Golden, members, review | Optional changes, history, lineage, and metrics projections |
 | Downstream use | SQL and ordinary PostgreSQL CDC | Semantic events and resolved entities as revision-bound sources |
 | Reproducibility | Current-state semantic manifest and reference rebuild | Complete resolution manifest, replay horizon, upgrade classes, audit-grade prepared runs |
-| Execution | One outer transaction with full-entity MDM resolution | Proven affected-set resolution and checkpointed multi-worker private work with one atomic final promotion |
+| Execution | One outer transaction with full-entity MDM resolution | One-transaction evidence preparation, then checkpointed multi-worker MDM work with one atomic final promotion; graph refresh itself is not resumable |
 | Operations | PostgreSQL roles, locks, backup, replication, and resource controls | Namespaces, quotas, fairness, SLOs, verify, failover validation, and recovery workflows |
 | Storage | PostgreSQL-managed current and minimum explanation state | Data-class retention, legal holds, checkpoints, history compaction, and explicit capability downgrade |
 | Security | Execution roles, protected internals, masking | Namespace isolation, sensitivity-driven storage, verified custom-code policy, digest-key management |
@@ -537,7 +545,7 @@ This table summarizes where the release boundary now sits.
 
 V2 is acceptable when every implemented capability remains reachable through the five normal actions or a clearly privileged stewardship or administration function, leaves the three V1 primary outputs stable, preserves existing V1 definitions under their pinned semantic versions, publishes atomically, and provides a bounded explanation of its effect. The compiler must validate each capability's pinned prerequisites before source work begins. A capability is not complete until its failure boundary, migration path, rollback or abandonment behavior, retention requirements, and interaction with incremental and full reference resolution are tested.
 
-A source-contract feature must prove its boundary, per-record event order, lifecycle semantics, and any source-identity migration. A valid-time feature must keep publication and business time distinct and define the identity of every historical projection. A custom function must have a statically resolved and allowlisted dependency closure. A new clustering or continuity policy must be versioned and previewable. An entity-level stewardship operation must name its base publication and durable constraint scope. A semantic feed must define order, replay, retention, gaps, resynchronization, and no-change revision behavior. A downstream entity must pin upstream revisions. A resumable run must publish exactly the result of its immutable manifest or publish nothing.
+A source-contract feature must prove its boundary, per-record event order, lifecycle semantics, and any source-identity migration. A valid-time feature must keep publication and business time distinct and define the identity of every historical projection. A custom function must have a statically resolved and allowlisted dependency closure. A new clustering or continuity policy must be versioned and previewable. An entity-level stewardship operation must name its base publication and durable constraint scope. A semantic feed must define order, replay, retention, gaps, resynchronization, and no-change revision behavior. A downstream entity must pin upstream revisions. A checkpointed MDM run must publish exactly the result of its immutable prepared-generation manifest or publish nothing.
 
 The test program must continue to compare incremental, prepared, resumed, and full-reference results under generated source changes, late events, corrections, definition changes, directives, locks, merges, splits, candidate overflow, worker failure, failover, retention boundaries, and `pg_trickle` upgrades. Physical execution choices may change, but memberships, ID continuity, goldens, reviews, semantic events, and explanations must remain equal for the same manifest.
 

@@ -43,20 +43,20 @@ The design also separates semantic choices from physical execution. Cleaners, ca
 
 ## Project status
 
-The proposed V1 release resolves records already stored in supported PostgreSQL relations. It covers tracked tables, soft-delete sources, complete snapshots, deterministic built-in matching, bounded candidate generation, full-entity resolution, stable IDs, field-level golden records, pair-level stewardship, review, explanation, and atomic publication. V1 intentionally leaves custom matching code, approximate retrieval, valid-time history, direct merge and split workflows, multi-entity dependencies, resumable runs, namespaces, quotas, and other enterprise controls outside its first compatibility promise.
+The proposed V1 release resolves records already stored in supported local or partitioned PostgreSQL tables. It covers tracked and soft-delete sources, deterministic built-in matching, bounded candidate generation, full-entity resolution, stable IDs, field-level golden records, pair-level stewardship, review, explanation, and atomic publication. V1 intentionally leaves complete snapshots, custom matching code, approximate retrieval, valid-time history, direct merge and split workflows, multi-entity dependencies, resumable runs, namespaces, quotas, and other enterprise controls outside its first compatibility promise.
 
 The V2 roadmap is cumulative rather than a replacement for V1. It explores those advanced capabilities while preserving the same five nouns, five actions, and three primary outputs. Each optional feature must declare its dependencies, deterministic semantics, migration path, failure boundary, and retention needs; unsupported combinations fail closed instead of silently producing a weaker answer.
 
 Read the design documents for the normative details:
 
 - [DESIGN_V1.md](DESIGN_V1.md) defines the proposed first open-source release, including its SQL model, algorithms, invariants, security boundary, and acceptance criteria.
-- [DESIGN_V2.md](DESIGN_V2.md) describes the post-V1 roadmap for richer source contracts, stewardship, history, integration, resumable execution, and shared operations.
+- [DESIGN_V2.md](DESIGN_V2.md) describes the post-V1 roadmap for richer source contracts, stewardship, history, integration, checkpointed MDM execution, and shared operations.
 
 ## Contributing
 
 The most useful contributions at this stage are concrete design reviews. A good review identifies a source-system behavior, matching failure, stewardship workflow, PostgreSQL constraint, or operational recovery case that the current contracts do not handle. Proposed changes should preserve complete candidate evaluation, deterministic results, atomic publication, durable identity, and bounded explanation, or state plainly why one of those guarantees needs to change.
 
-Implementation work should follow the V1 release boundary rather than pulling roadmap features into the first compatibility promise. In particular, the public SQL API depends on a supported, versioned `pg_trickle` integration contract and a shared conformance suite for transactional refresh, rollback, concurrency, source frontiers, scheduler exclusion, and recovery.
+Implementation work should follow the V1 release boundary rather than pulling roadmap features into the first compatibility promise. In particular, the public SQL API requires `external_graph_refresh` major 1 through `pgtrickle.integration_capabilities()` and a shared conformance suite for graph contracts, transactional refresh, rollback, concurrency, source boundaries, durable `EXTERNAL` orchestration, clone isolation, and recovery.
 
 ## License
 
