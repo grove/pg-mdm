@@ -34,13 +34,13 @@ V2 is where the system may become suitable for larger organizations, more varied
 |---|---|---|
 | Source ingestion | Local tracked, soft-delete, and complete-snapshot relations | Ordered change feeds, external snapshot providers, richer lifecycle states, schema contracts, replay horizons, and distributed-source proofs |
 | Time | Current state at an immutable publication revision | Effective time, late corrections, source-version history, and explicitly qualified point-in-time projections |
-| Configuration | Built-in presets and one-level composition | Versioned organization fragments, nested canonical composition, per-path provenance, inference, and regression fixtures |
+| Configuration | One optional built-in preset with entity-local overrides | Versioned organization fragments, nested canonical composition, per-path provenance, inference, and regression fixtures |
 | Matching | Built-in cleaners, comparators, and complete candidate channels | Registered custom functions, declared lookup relations, expert candidate keys, additional evidence models, and richer diagnostics |
 | Clustering | One conservative policy | Several versioned conservative policies and bounded component checks |
 | Stewardship | Pair `MATCH`, pair `NOT_MATCH`, and anchored golden override | Merge, split, move-member, locks, scoped invariant overrides, approvals, assignment, and bounded bulk action |
 | Stable identity | One merge and split continuity policy | Weighted continuity, canonical-ID locks, durable anchors, and planned identity migrations |
 | Downstream use | Ordinary SQL and ordinary PostgreSQL CDC | Semantic change feed, revision-bound entity dependencies, retained lineage, and optional external delivery |
-| Execution | One synchronous outer transaction | Optional prepared, checkpointed, resumable runs with an atomic final promotion |
+| Execution | One synchronous outer transaction with full-entity MDM resolution | Proven affected-set resolution and optional prepared, checkpointed, resumable runs with an atomic final promotion |
 | Operations | One administrative scope using PostgreSQL controls | Namespaces, quotas, fairness, service objectives, restore verification, retention policies, and deeper health diagnostics |
 
 No V2 feature may weaken the V1 fail-closed rules. A richer source adapter cannot turn an unproven watermark into completeness. A custom candidate generator cannot use truncation as proof of non-match. A bulk stewardship action cannot accept an incompletely evaluated population. A workload budget cannot lower a match threshold. More capability means more explicit contracts, not more opportunities to guess.
@@ -50,6 +50,8 @@ No V2 feature may weaken the V1 fail-closed rules. A richer source adapter canno
 ## 3. Architecture and the richer `pg_trickle` contract
 
 The V1 implementation compiles each immutable entity definition into a private `pg_trickle` graph and refreshes that graph inside the same transaction that resolves and publishes the MDM entity. V2 keeps that path as the default for small and medium entities because it is simple and has a strong atomicity story. V2 adds a prepared execution path for entities whose evidence graph or clustering work cannot reasonably fit in one transaction, but the prepared path is optional and must preserve the same semantic result.
+
+V2 may also optimize the transactional path with affected-set MDM resolution. The full resolver remains the reference semantics. An affected-set implementation must consume a complete durable terminal delta, define and prove its closure rule, fall back to full resolution whenever completeness is uncertain, and pass generated equivalence tests for evidence changes, merges, splits, and stewardship decisions before it can publish results.
 
 The extension-to-extension boundary remains a versioned SQL contract. V2 may require `pg_trickle` to expose capabilities such as strict graph refresh, immutable prepared graph generations, durable terminal-delta consumers, source-boundary manifests, safe promotion and abandonment, graph-specification export, and capability negotiation. The concrete SQL names can evolve before release, but the behaviors are normative. `pg_mdm` must be able to discover which capabilities are present, pin their contract versions in the entity manifest, and reject an unsupported combination before source work begins.
 
@@ -131,7 +133,7 @@ Valid-time resolution can be expensive because a correction may change candidate
 
 ## 7. Configuration composition and provenance
 
-V1 supports versioned built-in presets and shallow composition. V2 may add organization fragments after repeated entity definitions show that users need to share source conventions, field definitions, evidence groups, masking rules, golden policies, or expert candidate settings. A fragment is a versioned partial definition, not a sixth product noun and not a runtime entity.
+V1 supports one optional versioned built-in preset with entity-local overrides. V2 may add organization fragments after repeated entity definitions show that users need to share source conventions, field definitions, evidence groups, masking rules, golden policies, or expert candidate settings. A fragment is a versioned partial definition, not a sixth product noun and not a runtime entity.
 
 Every reference to a preset or fragment pins an exact version. The compiler rejects cycles, expands references before semantic validation, and requires an entity-local resolution for every conflicting scalar or incompatible collection item. There is no implicit last-writer-wins rule, and one entity never inherits the mutable state of another entity. Built-in presets, organization fragments, inferred proposals, and direct declarations all pass through the same canonical expansion path.
 
@@ -501,10 +503,10 @@ This table summarizes where the release boundary now sits.
 | Area | V1 contract | V2 addition |
 |---|---|---|
 | Product model | Five nouns, five actions, three primary outputs | No change |
-| `pg_trickle` integration | Strict transactional private-graph refresh and terminal delta | Prepared generations, durable leases, promotion, resumability, richer capability negotiation |
+| `pg_trickle` integration | Strict transactional private-graph refresh | Durable terminal deltas, prepared generations, durable leases, promotion, resumability, richer capability negotiation |
 | Sources | Local tracked, soft-delete, and complete snapshot | Full contracts, ordered events, external adapters, lifecycle states, row scope, schema and replay policy |
 | Time | Immutable publication revisions | Effective time, observed time, late corrections, point-in-time projections |
-| Configuration | Built-in presets and shallow composition | Organization fragments, nested canonical expansion, per-path provenance |
+| Configuration | One optional built-in preset with entity-local overrides | Organization fragments, nested canonical expansion, per-path provenance |
 | Verification | Validation, diagnostic sampling, exact named subjects | Full exact preview, labeled fixtures, metrics, inference, stewardship impact |
 | Matching | Built-in exact and fuzzy evidence | Registered functions, declared lookups, richer evidence, model-backed inputs |
 | Candidate discovery | Complete deterministic built-in channels | Expert candidate keys, supplemental approximate discovery, richer overflow strategies |
@@ -515,7 +517,7 @@ This table summarizes where the release boundary now sits.
 | Outputs | Golden, members, review | Optional changes, history, lineage, and metrics projections |
 | Downstream use | SQL and ordinary PostgreSQL CDC | Semantic events and resolved entities as revision-bound sources |
 | Reproducibility | Current-state semantic manifest and reference rebuild | Complete resolution manifest, replay horizon, upgrade classes, audit-grade prepared runs |
-| Execution | One outer transaction | Checkpointed multi-worker private work with one atomic final promotion |
+| Execution | One outer transaction with full-entity MDM resolution | Proven affected-set resolution and checkpointed multi-worker private work with one atomic final promotion |
 | Operations | PostgreSQL roles, locks, backup, replication, and resource controls | Namespaces, quotas, fairness, SLOs, verify, failover validation, and recovery workflows |
 | Storage | PostgreSQL-managed current and minimum explanation state | Data-class retention, legal holds, checkpoints, history compaction, and explicit capability downgrade |
 | Security | Execution roles, protected internals, masking | Namespace isolation, sensitivity-driven storage, trusted custom-code policy, digest-key management |
