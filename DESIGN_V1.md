@@ -1,110 +1,55 @@
 # `pg_mdm` OSS v1 design
 
-## A small PostgreSQL-native contract for entity resolution and golden records
+## Deterministic entity resolution and golden records on PostgreSQL
 
 **Status:** Proposed first open-source release  
-**Goal:** Ship a useful, deterministic MDM extension without making long-term operational features part of the first compatibility promise  
-**Product contract:** Five nouns, five actions, and three outputs
+**Foundation:** [`pg_trickle`](https://github.com/trickle-labs/pg-trickle) provides change capture and incremental relational maintenance  
+**Goal:** Ship a useful, conservative MDM system while keeping advanced source contracts, stewardship workflows, and enterprise operations outside the first compatibility promise  
+**Product contract:** Five nouns, five actions, and three public outputs
 
 ---
 
 ## 1. Release boundary
 
-`pg_mdm` v1 resolves records already available through PostgreSQL relations. A user defines a real-world entity, maps source columns to logical fields, describes matching evidence, and chooses golden values. The extension publishes a durable membership map, one golden record per entity, and a review queue.
+`pg_mdm` v1 resolves records that already exist in PostgreSQL. A user defines a real-world entity, maps source columns to logical fields, describes which agreements count as identity evidence, and chooses how each golden value should be selected. The extension then publishes a durable membership map, one golden record per resolved entity, and a review queue for decisions that should not be made automatically.
 
-The public model has five nouns:
+The user-facing model deliberately remains small. It has five nouns—`source`, `field`, `match`, `entity`, and `golden_value`—and normal operation has five actions—`create`, `describe`, `preview`, `refresh`, and `explain`. Every entity has three stable public output tables: `mdm_out.<entity>`, `mdm_out.<entity>_members`, and `mdm_out.<entity>_review`. Definition versions, source-record identities, publication revisions, operation records, aliases, and private evidence relations are real system objects, but they are supporting lifecycle objects rather than additional concepts a normal user must configure.
 
-1. **source**
-2. **field**
-3. **match**
-4. **entity**
-5. **golden value**
+The central architectural rule is simple:
 
-Normal operation has five actions:
+> **`pg_trickle` maintains changing relational facts; `pg_mdm` decides identity.**
 
-1. **create**
-2. **describe**
-3. **preview**
-4. **refresh**
-5. **explain**
-
-Every entity has three public outputs:
-
-1. `mdm_out.<entity>`
-2. `mdm_out.<entity>_members`
-3. `mdm_out.<entity>_review`
-
-This boundary is the main compatibility promise. Candidate pairs, normalized values, graph edges, publication revisions, invalidation state, and physical indexes remain engine details.
-
-V1 deliberately limits its other promises. PostgreSQL supplies transactions, MVCC, locking, backup, replication, permissions, and workload controls. The extension does not duplicate those systems in its first release.
-
-### 1.1 What v1 includes
+`pg_trickle` is responsible for capturing source changes, maintaining normalized and candidate relations incrementally, tracking complete source frontiers, ordering private dependency graphs, and falling back to a full relational recomputation when incremental maintenance is not safe. `pg_mdm` is responsible for pair decisions, manual constraints, conservative clustering, stable `mdm_id` continuity, golden overrides, reviews, and atomic publication. This division keeps generic incremental SQL machinery out of the MDM engine while ensuring that identity semantics remain explicit, versioned, and explainable.
 
 ```text
-Definition
-  source
-  field
-  match
-  entity
-  golden_value
-
-Actions
-  create
-  describe
-  preview
-  refresh
-  explain
-
-Outputs
-  entity
-  members
-  review
-
-Matching
-  exact
-  fuzzy
-  identity / strong / supporting
-
-Stewardship
-  MATCH
-  NOT_MATCH
-  golden override
-
-Sources
-  snapshot
-  soft_delete
-  changed_at
-
-Engine
-  deterministic normalization
-  bounded candidate generation
-  conservative clustering
-  stable mdm_id
-  incremental refresh
-  atomic publication
-  golden provenance
+Source relations
+      │
+      ▼
+Private pg_trickle graph
+  projected records
+  normalized values
+  candidate blocks
+  candidate pairs
+  pair evidence
+  golden candidates
+      │
+      ▼
+pg_mdm resolver
+  decisions
+  component checks
+  clustering
+  stable IDs
+  golden values
+  reviews
+      │
+      ▼
+Public base tables
+  mdm_out.<entity>
+  mdm_out.<entity>_members
+  mdm_out.<entity>_review
 ```
 
-### 1.2 What v1 does not promise
-
-V1 does not include:
-
-- namespace or multi-tenant resource isolation
-- formal service-level objectives
-- workload fairness or extension-managed backpressure
-- resumable multi-worker coordination
-- backup, failover, or restore verification beyond normal PostgreSQL behavior
-- configurable storage lifecycle or compaction
-- valid-time reconstruction or late-event correction
-- downstream entity dependency graphs
-- a semantic downstream change feed
-- organization fragment graphs or nested configuration composition
-- statistically representative global merge and split estimates
-- custom candidate generation or component checks
-- merge, split, move-member, or lock workflow operations
-- multiple clustering policies
-
-These are candidates for later releases, not hidden v1 requirements. [DESIGN_V2.md](DESIGN_V2.md) records them without expanding the v1 contract.
+V1 includes deterministic built-in normalization, exact and bounded fuzzy comparisons, bounded candidate generation, one conservative clustering policy, stable entity identity, anchored golden overrides, incremental refresh, full-rebuild fallback, atomic publication, and current-state explanation with limited publication history. It does not include custom matching code, approximate nearest-neighbor discovery, generic foreign-source contracts, valid-time reconstruction, a semantic downstream change feed, direct entity merge or partitioned split commands, alternate clustering policies, managed downstream MDM dependencies, multi-tenant resource isolation, resumable multi-transaction runs, configurable history compaction, formal service objectives, or extension-managed workload fairness. Those capabilities belong in the V2 roadmap and are not hidden V1 requirements.
 
 ---
 
@@ -112,76 +57,69 @@ These are candidates for later releases, not hidden v1 requirements. [DESIGN_V2.
 
 ### 2.1 Source
 
-A source is a PostgreSQL table, view, materialized view, or compatible foreign relation. It provides:
+A source is a PostgreSQL relation whose rows represent records that may participate in one entity definition. V1 supports local tables, partitioned tables, materialized views, and ordinary views that `pg_trickle` can safely inline to supported local relations. Each source has a stable name within the entity, a declared source mode, one or more source-key columns, mappings from physical columns to logical fields, and optional field authority. Generic foreign tables are not part of the V1 promise because a remote relation cannot be treated as a complete PostgreSQL snapshot unless its provider can prove that data and observation position describe the same remote state.
 
-- a unique and stable source ID
-- mappings from physical columns to logical fields
-- one of the three v1 source modes
-- optional source authority for matching or golden selection
-
-Within one entity, `(source, source_id)` identifies one source record. Reusing a key for a different real-world record is unsupported.
+The source key must be backed by a primary key or by a non-partial, non-expression, immediate unique index whose key values cannot be ambiguously null. V1 allows scalar and supported composite keys. The key is encoded with the versioned typed row-identity contract supplied by `pg_trickle`, combined with the entity and source identity, and stored as a durable internal `source_record_key`. The first time a key is observed, `pg_mdm` also allocates an opaque `source_record_id` for convenient references in stewardship and explanation. Reusing the same source key for a different real-world source record is unsupported.
 
 ### 2.2 Field
 
-A field is a logical attribute such as `name`, `email`, `phone`, or `tax_id`. Sources may map different columns to the same field. A field defines its type, cleaner, and basic missing-value rules.
+A field is a logical attribute such as `name`, `email`, `phone`, `date_of_birth`, or `tax_id`. Different sources may map differently named physical columns to the same field. A field declares a logical PostgreSQL type, one versioned built-in cleaner, cleaner options where needed, and a display policy for review and explanation. V1 requires a UTF-8 database and uses deterministic binary ordering for semantic tie breaks so that locale-sensitive query plans do not change identity results.
 
-V1 recognizes these value states:
-
-- `value`
-- `absent`
-- `empty`
-- `invalid`
-- `unknown`
-- `redacted`
-- `unsupported`
-
-The engine keeps source values unchanged and stores normalized values separately. Missing or invalid values provide no positive or negative matching evidence unless a built-in comparison explicitly says otherwise.
+Cleaning never overwrites source data. The private evidence graph stores the original value only when current golden output or provenance requires it, and stores normalized values separately. A cleaner returns one of the states `value`, `absent`, `empty`, `invalid`, `unknown`, `redacted`, or `unsupported`. Values that are absent, empty, invalid, unknown, redacted, or unsupported provide no positive or negative automatic matching evidence. An invalid value from a source declared authoritative may create a review because it weakens a promised identity check.
 
 ### 2.3 Match
 
-A match says how fields provide identity evidence. It combines:
+A match describes how one or more fields contribute identity evidence. It names a built-in exact or fuzzy comparison, assigns the result the strength `identity`, `strong`, or `supporting`, and assigns an `evidence_group`. Evidence groups make correlation explicit: two rules derived from the same underlying fact, such as an email-address rule and an email-domain rule, cannot be counted as independent evidence merely because they are separate rules.
 
-- `exact` or `fuzzy` comparison
-- `identity`, `strong`, or `supporting` evidence
-
-Identity evidence may decide a match and blocks a merge when valid authoritative values disagree. Strong evidence can produce an automatic match under the built-in decision table. Supporting evidence can strengthen a decision or create a review, but cannot produce an automatic match by itself.
+Identity evidence is intended for identifiers that can decide a pair by themselves, such as a trustworthy tax identifier. Strong evidence may create an automatic pair edge, such as an exact normalized email match. Supporting evidence can reinforce a strong edge, help admit a singleton into an established component, or create a review, but it never creates an automatic pair edge by itself. Source authority is evaluated separately: two valid, different authoritative identity values create an automatic conflict unless a steward has recorded an explicit `MATCH` decision.
 
 ### 2.4 Entity
 
-An entity is the real-world thing being mastered, such as a company, person, supplier, or product. Its definition owns sources, fields, matches, golden values, and conservative safety options.
+An entity is the real-world thing being mastered, such as a person, company, supplier, account, or product. Its immutable definition owns its sources, fields, matches, golden policies, masking rules, and built-in preset versions. The entity definition expresses what identity means. It does not expose worker counts, SQL join order, indexes, temporary-table choices, or physical query plans.
 
-The entity does not expose graph algorithms, score arithmetic, candidate channels, worker counts, or index choices. The engine derives those details.
+The compiler does expose the logical candidate plan because candidate discovery is part of matching semantics. It records which deterministic predicates can discover a pair, which evidence rules are evaluated for those pairs, and which hard completeness limits apply. The implementation may change indexes or execution strategies without changing the definition, but it may not silently change the logical set of pairs a pinned definition is supposed to examine.
 
 ### 2.5 Golden value
 
-A golden value selects one output field independently from the entity's members. V1 includes these policies:
+A golden value selects one output field independently from the current members of an entity. V1 includes only versioned built-in policies: `prefer_source`, `latest`, `first_non_null`, and `most_common`. Source authority for matching does not automatically make a source preferred for every output field, so golden precedence is always explicit.
 
-- `prefer_source`
-- `latest`, when the source has a trustworthy `changed_at`
-- `first_non_null`
-- `most_common`
-- custom registered selector
-
-Every selected value keeps provenance to the source record and source column, or to the registered selector and all contributing source values.
+Every selected value retains provenance. At minimum, provenance identifies the `mdm_id`, field, selected value, normalized value, winning source record when one exists, policy and policy version, deterministic tie-break reason, definition version, and publication revision. A computed policy such as `most_common` also records the contributing normalized values and the source record chosen to supply the published spelling.
 
 ---
 
-## 3. Entity definitions
+## 3. Source modes and completeness
 
-An entity definition is an immutable, versioned value. `mdm.create()` accepts a complete definition and stores a new version only when its semantics differ from the current version.
+V1 replaces the earlier `changed_at` polling idea with source modes that describe how completeness is actually established. A timestamp can be useful metadata, but it is not a commit-order or completeness proof. A source may still map a trustworthy row-change timestamp for the `latest` golden policy, but `pg_mdm` does not use that timestamp to decide whether all source changes have been consumed.
 
-V1 supports:
+| Mode | Eligible relations | Change detection | Deletion behavior | Completeness at publication |
+|---|---|---|---|---|
+| `tracked` | Local table, partitioned table, or safely inlined local view | `pg_trickle` trigger or WAL capture | Hard deletes are captured explicitly | Inserts, updates, and deletes are proven through the recorded frontier |
+| `soft_delete` | Same relations as `tracked`, plus a deletion predicate | `pg_trickle` capture plus predicate evaluation | A matching predicate makes the row inactive; a hard delete is also captured | Lifecycle changes and hard deletes are proven through the recorded frontier |
+| `snapshot` | Supported local relation or materialized view | Complete relation comparison | A previously known key missing from the complete scan is inactive | Inserts, updates, and deletions are proven at the recorded snapshot boundary |
 
-- built-in presets such as `person`, `company`, and `product`
-- one optional `preset`, or a one-level `compose` list of versioned built-in presets
-- explicit entity-local overrides
-- fully expanded output from `mdm.describe()`
+A tracked source is the preferred V1 mode. `pg_trickle` captures committed changes and gives the private graph a contiguous source frontier, so `pg_mdm` does not need a second CDC mechanism or a user-maintained watermark. A soft-delete source uses the same capture path but treats a declared predicate such as `deleted_at IS NOT NULL` as a business lifecycle signal. The source record identity and tombstone remain durable, and a later reactivation of the same key is processed as a normal lifecycle change.
 
-One-level means that an entity may compose presets, but those public preset inputs may not compose other user-defined inputs. V1 has no user-defined fragment registry. Conflicting preset values must be resolved by an entity-local override, and unresolved conflicts fail validation. The stored definition contains the expanded result and exact built-in preset versions, so a later preset release cannot silently change an active entity.
+Snapshot mode is intended for relations that cannot be tracked directly or whose producer publishes complete replacement snapshots. The refresh must perform a complete scan before absence can mean deletion. Between scans, `pg_mdm` may not know whether the relation has changed, so `describe()` reports that pending state as unknown even though the last published snapshot was complete. A partial extract must never be presented as a snapshot source.
 
-`mdm.describe(format => 'definition')` returns a canonical expanded definition that can be passed to `mdm.create()` in another database. Import resolves qualified relation and function names in the target database and fails if their required signatures differ. Physical indexes and batch choices are not part of the portable definition.
+Every publication records the exact source boundaries returned by `pg_trickle`. The word `current` means current through those recorded boundaries, not identical to the database at the instant a later reader runs a query. `mdm.describe()` shows both `change_completeness` and `deletion_completeness` for each source, together with the frontier or snapshot identifier and whether later work is known, unknown, or pending.
 
-The constructors below illustrate the model rather than fix the final PostgreSQL type signatures:
+A definition may use an ordinary view only when `pg_trickle` can resolve and validate its complete local dependency set under the entity execution role. A view that depends on volatile functions, caller-dependent settings, unsafe row-security behavior, temporary objects, or unsupported remote relations is rejected. A materialized view is treated as a snapshot relation unless it is itself maintained by a supported and revision-bound mechanism.
+
+---
+
+## 4. Entity definitions and versions
+
+An entity definition is an immutable, versioned value. `mdm.create()` accepts a complete definition and stores a new desired version only when its semantic digest differs from the current desired version. Updating an existing entity requires `expected_version`, which prevents accidental overwrites. Reusing an identical semantic definition is a no-op.
+
+V1 supports versioned built-in presets such as `person`, `company`, and `product`, one optional preset or a one-level list of built-in presets, and explicit entity-local overrides. Presets may not silently change an active entity. The stored definition contains the fully expanded value and exact preset versions, and unresolved conflicts between composed presets cause validation to fail. V1 does not include user-defined reusable fragments or nested configuration graphs.
+
+The semantic digest covers the expanded definition, source-key encoding version, built-in cleaner and comparator versions, the compiled logical candidate plan, pair-decision-table version, clustering-policy version, stable-ID policy version, golden-policy versions, and the `pg_mdm` semantic engine version. It also records the supported `pg_trickle` integration-contract version and the canonical specification digest of every private stream table. Physical indexes, planner choices, batch sizes, and worker counts are not semantic inputs.
+
+Each definition version compiles to a new private `pg_trickle` graph generation. The active graph is never altered in place to adopt new matching semantics. A proposed version receives its own private relations, is validated independently, and becomes active only when `mdm.refresh()` successfully publishes an MDM revision under that version. After activation, the previous graph may be retired once the minimum explanation horizon has been preserved. This generation model prevents an online query alteration or extension upgrade from silently changing the evidence behind an active publication.
+
+`mdm.describe(format => 'definition')` returns the canonical expanded definition without private relation names or physical storage choices. It can be passed to `mdm.create()` in another database, where relation names and source-key contracts are resolved again. Portability does not mean that independently initialized databases receive identical newly allocated UUIDs; it means they compile the same matching semantics and reject incompatible dependencies explicitly.
+
+The constructors below illustrate the intended model rather than freeze the final PostgreSQL type signatures:
 
 ```sql
 WITH proposed AS (
@@ -191,56 +129,60 @@ WITH proposed AS (
 
         sources => ARRAY[
             mdm.source(
-                name       => 'crm',
-                relation   => 'crm.customer'::regclass,
-                source_id  => 'id',
-                mode       => 'changed_at',
-                changed_at => 'updated_at',
-                fields     => jsonb_build_object(
+                name           => 'crm',
+                relation       => 'crm.customer'::regclass,
+                source_id      => ARRAY['id'],
+                mode           => 'tracked',
+                row_changed_at => 'updated_at',
+                fields         => jsonb_build_object(
                     'name',   'display_name',
                     'email',  'email_address',
                     'tax_id', 'vat_number'
                 )
             ),
             mdm.source(
-                name         => 'registry',
-                relation     => 'registry.company'::regclass,
-                source_id    => 'registry_id',
-                mode         => 'snapshot',
-                fields       => jsonb_build_object(
+                name      => 'registry',
+                relation  => 'registry.company'::regclass,
+                source_id => ARRAY['registry_id'],
+                mode      => 'snapshot',
+                fields    => jsonb_build_object(
                     'name',   'registered_name',
                     'email',  null,
                     'tax_id', 'registered_tax_id'
                 ),
-                authority    => jsonb_build_object(
-                    'identity', 'authoritative',
-                    'name',     'authoritative',
-                    'tax_id',   'authoritative'
+                authority => jsonb_build_object(
+                    'tax_id', 'authoritative'
                 )
             )
         ],
 
         fields => ARRAY[
-            mdm.field(name => 'name', cleaner => 'company_name'),
-            mdm.field(name => 'email', cleaner => 'email'),
-            mdm.field(name => 'tax_id', cleaner => 'tax_id')
+            mdm.field(name => 'name',   type => 'text', cleaner => 'company_name'),
+            mdm.field(name => 'email',  type => 'text', cleaner => 'email'),
+            mdm.field(name => 'tax_id', type => 'text', cleaner => 'tax_id')
         ],
 
         matches => ARRAY[
             mdm.match(
-                fields     => ARRAY['tax_id'],
-                comparison => 'exact',
-                strength   => 'identity'
+                name           => 'same_tax_id',
+                fields         => ARRAY['tax_id'],
+                comparison     => 'exact',
+                strength       => 'identity',
+                evidence_group => 'tax_identity'
             ),
             mdm.match(
-                fields     => ARRAY['email'],
-                comparison => 'exact',
-                strength   => 'strong'
+                name           => 'same_email',
+                fields         => ARRAY['email'],
+                comparison     => 'exact',
+                strength       => 'strong',
+                evidence_group => 'email'
             ),
             mdm.match(
-                fields     => ARRAY['name'],
-                comparison => 'fuzzy',
-                strength   => 'supporting'
+                name           => 'similar_name',
+                fields         => ARRAY['name'],
+                comparison     => 'fuzzy',
+                strength       => 'supporting',
+                evidence_group => 'name'
             )
         ],
 
@@ -251,8 +193,9 @@ WITH proposed AS (
                 sources => ARRAY['registry', 'crm']
             ),
             mdm.golden_value(
-                field  => 'email',
-                policy => 'latest'
+                field   => 'email',
+                policy  => 'prefer_source',
+                sources => ARRAY['crm']
             ),
             mdm.golden_value(
                 field   => 'tax_id',
@@ -270,271 +213,215 @@ SELECT mdm.create(
 FROM proposed;
 ```
 
-The definition says what identity means. It does not prescribe an index, candidate count, score threshold, graph implementation, or batch size.
+V1 allows additive evolution of the public golden table. A new golden field may be appended when a new definition becomes active. Removing, renaming, reordering, or changing the PostgreSQL type of an existing public golden column is rejected in V1; users who need a breaking output contract create a new entity name. Internal matching fields may be added or removed because they do not change the public table schema, but every such change creates a new semantic definition and private graph generation.
 
 ---
 
-## 4. Source modes
+## 5. The `pg_trickle` integration contract
 
-V1 has three source modes. This is the complete source lifecycle contract for the release.
+`pg_mdm` depends on `pg_trickle` as a supported extension, not as a collection of private tables to query. It must never read or write `pg_trickle` private catalogs, frontiers, change buffers, scheduler tables, or generated implementation columns. The two projects interact through a small, versioned SQL contract whose behavior is stable even if `pg_trickle` changes its internal storage or execution plan.
 
-| Mode | Required configuration | Deletion behavior | `deletion_completeness` |
-|---|---|---|---|
-| `snapshot` | Stable key | A key missing from the relation at the refresh snapshot is deleted | `proven` after a successful complete scan |
-| `soft_delete` | Stable key, deletion predicate, and a source guarantee that keys are not hard-deleted | A row matching the predicate is deleted | `proven` through the visible `changed_at` boundary when every change updates that column |
-| `changed_at` | Stable key and trustworthy `changed_at` | Hard deletion cannot be detected | `unknown` |
+The first required primitive is a strict transactional refresh of a named private graph. It accepts the expected stream-table specification digests, refreshes the graph in dependency order against one coherent source-boundary decision, and returns a machine-readable result. A concurrent refresh is an error rather than a notice-and-skip outcome. The result identifies the group refresh, complete source frontier, per-node action such as `NO_DATA`, `DIFFERENTIAL`, or `FULL`, and the specification and row-identity versions actually used. The refresh and frontier advancement occur inside the caller's outer PostgreSQL transaction, so a later `pg_mdm` failure rolls the private graph and its consumed frontiers back with the public MDM publication.
 
-`mdm.describe()` exposes one deletion status per source:
+The second required primitive is a durable output-delta contract for the terminal evidence relations. `pg_mdm` registers as a consumer, reads inserts, deletes, and changed rows through a particular group refresh, and acknowledges that delta in the same transaction that publishes the corresponding MDM revision. When `pg_trickle` performs a full recomputation and cannot provide an exact incremental output delta, it returns a `FULL_INVALIDATION` marker. `pg_mdm` then runs its full reference resolver rather than guessing a local affected set. The precise SQL function names are an implementation decision; the strict refresh, version verification, durable delta, and full-invalidation behaviors are normative V1 requirements.
+
+All private MDM stream tables are manually driven. They are excluded from ordinary automatic scheduling so that pair evidence cannot advance independently of membership, golden values, and reviews. `mdm.refresh()` is the only normal coordinator that may advance the private graph. Administrators may schedule `mdm.refresh()` through ordinary PostgreSQL scheduling tools, but the `pg_trickle` scheduler does not publish an MDM entity by itself.
+
+V1 uses scheduled differential or automatic-full-fallback maintenance for private graphs. It does not use `pg_trickle` immediate mode because MDM clustering and stable-ID reconciliation are intentionally not performed inside every source DML statement. A `pg_trickle` choice between differential and full relational evaluation is a performance decision only: both paths must produce the same terminal evidence relations for the same source boundary and pinned graph specification.
+
+The `pg_mdm` package declares and checks an exact supported `pg_trickle` release line or integration-contract version. An unsupported version, unknown row-identity encoding, changed stream-table specification, or missing strict integration primitive blocks refresh before any public output changes. V1 is not considered complete until these extension-to-extension behaviors are tested under commit, rollback, concurrent source writes, full fallback, crash recovery, and extension upgrade.
+
+---
+
+## 6. The private evidence graph
+
+Each definition version compiles into a private graph of ordinary relational stages. A typical graph has a source-record stage that projects stable keys and mapped values, a normalized-value stage that applies built-in cleaners, one or more candidate-block stages, a canonical candidate-pair stage, a pair-evidence stage, and a golden-candidate stage. The exact number of stream tables is private, but `mdm.describe()` exposes the logical stages, predicates, hard limits, and specification digests so an operator can understand the work without depending on generated table names.
 
 ```text
-deletion_completeness = proven | unknown
+source relations
+      │
+      ▼
+records ──► normalized values ──► candidate blocks ──► candidate pairs
+                    │                                      │
+                    └──────────────────────────────────────► pair evidence
+                    │
+                    └──────────────────────────────────────► golden candidates
 ```
 
-The engine never interprets absence as deletion for `changed_at` sources. A `soft_delete` source that cannot guarantee retained tombstones has `deletion_completeness = unknown` and behaves like `changed_at` for hard deletions. Operators may run a broader reconciliation by changing the source to `snapshot`, restoring missing rows as soft-delete tombstones, or rebuilding from another complete relation.
+Candidate generation is deterministic and exact within its declared logical predicates. Identity and strong rules compile to built-in channels such as normalized exact equality, composite equality, deterministic prefixes, or bounded token blocks. Fuzzy comparison is evaluated only after a pair has been discovered by a complete built-in channel. Supporting rules reuse discovered pairs and cannot create an unbounded all-pairs scan. V1 does not use approximate nearest-neighbor indexes, planner-dependent top-k discovery, random sampling, or custom candidate-key functions in publication semantics.
 
-V1 resolves the source state visible to the refresh transaction. It records the publication revision and source observation boundary needed to explain that published state. It does not distinguish `effective_at` from `observed_at`, reconstruct business-valid history, reorder late events, or revise what the source is now believed to have meant in the past.
+The logical candidate plan is pinned with the definition. If an engine upgrade wants to replace one blocking predicate with another, change a tokenization rule, alter a block limit, or change the number of neighbors examined, that is a new semantic plan and requires a new entity definition version. PostgreSQL indexes and join algorithms may change freely as long as they enumerate the same logical pair set.
 
-Source schema checks cover mapped columns, types, stable-key uniqueness, and required change columns. Incompatible source changes stop refresh before publication. V1 does not define a general schema compatibility protocol.
+Every built-in channel has a hard completeness limit. If a block exceeds that limit, the refresh fails before publication and reports the offending channel, a non-sensitive block digest, its cardinality, and a next action. V1 does not publish singleton assignments for records whose required pair enumeration was truncated, because that would silently turn missing work into evidence of non-match. A lower warning threshold may create a review while the channel is still complete, but crossing the hard limit is always a fail-closed condition.
+
+V1 ships only extension-owned cleaners, comparators, and golden selectors. Their versions, options, fixed-point arithmetic, and tie ordering are pinned in the definition digest. User-defined PostgreSQL functions, relation lookups from semantic functions, network access, clock time, random state, custom component checks, and custom candidate generation are deferred because they would require a much larger dependency, invalidation, security, and reproducibility contract.
 
 ---
 
-## 5. The five actions
+## 7. Pair decisions
 
-### 5.1 `mdm.create()`
+A built-in comparator evaluates one candidate pair and returns a versioned evidence result. Exact rules return agreement, disagreement, or no usable evidence. Fuzzy rules additionally return a fixed-point similarity value and a built-in classification threshold, but floating-point arithmetic is not used in identity decisions. Every evidence item records its rule, evidence group, normalized inputs or protected digests, classification, and comparator version.
 
-`mdm.create()` validates and stores a complete entity definition. Validation covers:
+The pair-decision table is deliberately small and ordered. An active `NOT_MATCH` decision is a cannot-link constraint and always prohibits the pair. An active `MATCH` decision is an explicit human must-link and takes precedence over automatic evidence, including an authoritative identity conflict; this override is visible in every explanation. Without a manual decision, different valid authoritative identity values produce `AUTHORITATIVE_CONFLICT`. Otherwise an agreeing identity rule produces an automatic identity edge, and an agreeing strong rule produces an automatic strong edge. Supporting evidence alone produces no automatic edge, although it may create or prioritize a review.
 
-- source access and stable-key uniqueness
-- source mode requirements
-- field mappings and cleaner signatures
-- match completeness and bounded candidate discovery
-- golden policy inputs
-- registered extension function contracts
-- output naming and permissions
-
-The operation stores the user definition, expanded definition, semantic digest, creator, comment, and parent version. It does not publish new entities. `mdm.refresh()` publishes the desired definition.
-
-An existing entity update uses `expected_version` to prevent accidental overwrite. Reusing an identical semantic definition is a no-op.
-
-### 5.2 `mdm.describe()`
-
-`mdm.describe()` shows:
-
-- the concise and fully expanded definition
-- active and desired configuration versions
-- source modes and deletion completeness
-- fields, matching roles, and golden policies
-- the bounded candidate plan and required indexes
-- active publication revision and pending work
-- entity, singleton, conflict, and review counts
-- warnings and the last refresh result
-
-`format => 'definition'` returns the canonical expanded definition. V1 does not report namespace quotas, service objectives, change-feed retention, valid-time backlog, fragment graphs, or downstream dependency state.
-
-### 5.3 `mdm.preview()`
-
-V1 preview answers three questions:
-
-1. Is this definition or refresh valid?
-2. What index, scan, candidate, and clustering work will it require?
-3. What representative resolution changes does it produce?
-
-It has three modes:
-
-| Mode | Behavior |
+| Highest applicable condition | Pair result |
 |---|---|
-| `validation` | Validate and compile without resolving records |
-| `sampled` | Run a deterministic bounded sample and return representative changes |
-| `exact` | Resolve only explicitly supplied source records or `mdm_id` values |
+| Active `NOT_MATCH` | Prohibited pair |
+| Active `MATCH` | Manual match edge |
+| Conflicting valid authoritative identity values | Authoritative conflict and review |
+| At least one agreeing identity rule | Automatic identity edge |
+| At least one agreeing strong rule | Automatic strong edge |
+| Supporting evidence only | Review candidate or no edge |
+| No usable agreement | No edge |
 
-```sql
-SELECT *
-FROM mdm.preview(
-    entity     => 'customer',
-    definition => :proposed_definition,
-    mode       => 'sampled'
-);
-```
+Strong disagreement is not a universal cannot-link because many strong fields can legitimately change or be shared. It can lower the edge ordering, contribute to a review, or prevent a component-admission condition from being satisfied, but only an active `NOT_MATCH` or an automatic authoritative identity conflict blocks a union. Presets must therefore reserve `identity` and authoritative status for values whose disagreement really is meaningful.
 
-Preview labels every result as validation, sampled, or exact. It does not promise statistically meaningful global merge, split, or review counts. It does not run labeled regression suites, simulate arbitrary stewardship workflows, or become an alternate publication engine.
-
-### 5.4 `mdm.refresh()`
-
-`mdm.refresh()` resolves the source state visible to one consistent PostgreSQL transaction and atomically publishes a complete revision. Readers see either the prior revision or the new revision.
-
-Only one refresh or rebuild for an entity may publish at a time, enforced by an entity-scoped PostgreSQL advisory or row lock. Different entities may refresh concurrently. V1 does not coordinate multiple extension-managed workers within one refresh.
-
-The normal path is incremental:
-
-1. Detect inserted and changed records.
-2. Detect deletions only when the source mode proves them.
-3. Recompute changed normalized values.
-4. Regenerate affected candidates and pair evidence.
-5. Recluster the complete affected components.
-6. Reconcile stable IDs and golden values.
-7. Validate and publish in one transaction.
-
-If the engine cannot prove that local work is complete, it performs a broader scan or fails with an actionable error. Resource limits may delay or reject work. They may not produce a partial result or weaken matching rules.
-
-Refresh records counts, stage timings, source observation boundaries, configuration version, and decision version. A no-change refresh does not create a new semantic publication.
-
-### 5.5 `mdm.explain()`
-
-`mdm.explain()` describes one current or retained published subject:
-
-- a source record
-- a candidate pair
-- an entity
-- a golden field
-- a review item
-
-It shows normalized values, discovery reason, evidence, conflicts, accepted connections, manual decisions, stable-ID outcome, and golden provenance as relevant.
-
-When a pair was not generated, explain may perform one bounded on-demand comparison and report why normal candidate discovery omitted it. Historical explanation is by immutable publication revision only. V1 does not answer valid-time questions or provide a general cause graph between arbitrary revisions.
+Automatic edges are processed in a total deterministic order. Identity edges precede strong edges; edges with more independent agreeing evidence groups precede those with fewer; remaining built-in evidence vectors are compared lexicographically using fixed-point values; and exact ties are broken by the canonical encoded source-record pair. The order is a versioned part of the pair-decision policy and cannot change for an active definition.
 
 ---
 
-## 6. Matching and candidate discovery
+## 8. One conservative clustering policy
 
-V1 includes deterministic built-in cleaners for common text, company names, person names, email addresses, phone numbers, identifiers, dates, and numbers. Cleaner versions are part of the entity definition digest.
+V1 has one clustering policy. It is designed to prevent a common entity-resolution failure in which a chain of reused emails, phone numbers, or addresses gradually accretes unrelated records into one large component. The algorithm therefore evaluates both pair evidence and the current shape of the components it would join.
 
-The engine compiles identity and strong matches into bounded built-in candidate channels. Examples include exact normalized-value indexes, composite exact keys, bounded prefixes, token blocks, and bounded nearest-neighbor fuzzy search. Supporting evidence may reuse those candidates but does not create an unbounded all-pairs comparison.
+The resolver starts with one component per active source record and loads every active `NOT_MATCH` as a component-level cannot-link constraint. It then applies active `MATCH` decisions in canonical source-record order. A manual match is rejected at write time if its must-link closure would contain an active `NOT_MATCH`; otherwise it may join components even when automatic authoritative evidence disagrees, because the steward has explicitly chosen to override that evidence.
 
-Candidate discovery has two hard rules:
+Automatic edges are processed in the deterministic order defined above. Before any automatic union, the resolver rejects the union if it would place a `NOT_MATCH` pair in one component or if the two components contain conflicting valid authoritative identity values. It then applies the following admission rules:
 
-1. Every channel has a deterministic bound.
-2. Truncation or an oversized block is visible as review or failure, never as proof of non-match.
+| Components being joined | Automatic admission rule |
+|---|---|
+| Two singletons | One identity edge or one strong edge |
+| One singleton and one established component | One identity edge, or one strong edge plus an additional agreeing evidence group connecting the singleton to the component |
+| Two established components | Shared authoritative identity, or at least two independent strong cross-component connections on distinct member pairs |
 
-V1 does not allow custom candidate-key functions. A custom comparator must use a complete built-in candidate channel selected during definition validation.
+Two items of evidence are independent only when their compiled evidence groups differ and they are not alternate derivations of the same normalized fact. For an established-to-established union, the strong connections must also involve distinct cross-component member pairs; two rules on one pair do not prove that two existing clusters are broadly compatible. Supporting evidence may provide the additional independent group for a singleton joining an established component, but it cannot satisfy the established-to-established rule.
 
-Evidence uses deterministic fixed-point arithmetic and stable tie ordering. The same source snapshot, expanded definition, and active stewardship decisions produce the same pair decisions regardless of worker order or physical query plan.
-
----
-
-## 7. One conservative clustering algorithm
-
-V1 has one clustering algorithm. It is not configurable.
-
-1. Start with one component per active source record.
-2. Apply active `MATCH` decisions in canonical source-key order.
-3. Reject any union that would place an active `NOT_MATCH` pair in one component.
-4. Reject automatic unions with conflicting authoritative identity values.
-5. Process automatic match edges in descending evidence order with canonical source-key tie breaks.
-6. Allow a singleton to join a compatible component on one accepted automatic match.
-7. Join two non-singleton components only through shared authoritative identity or at least two independent strong cross-component matches.
-8. Send a plausible rejected union to review.
-
-This policy prevents one weak bridge from joining two established entities. Supporting evidence can rank or reinforce an edge, but cannot satisfy the strong cross-component requirement by itself.
-
-The engine stores enough accepted-edge and rejection information for `explain()`. Custom component checks and alternate component policies are deferred.
+A plausible automatic edge that fails component admission becomes a review item with the rejected bridge, component summaries, conflicting values, and the exact rule that was not satisfied. It is not silently discarded. Accepted edges and rejection reasons are retained for `mdm.explain()`. Alternate clustering algorithms, configurable component policies, and custom component checks are deferred to V2 because changing any of them is a major semantic compatibility decision.
 
 ---
 
-## 8. Stable identity
+## 9. Refresh, incremental work, and atomic publication
 
-Each active entity has a durable `mdm_id`. V1 uses one published rule set.
+`mdm.refresh()` is a synchronous transaction coordinator. V1 intentionally chooses one outer PostgreSQL transaction rather than a multi-transaction staging protocol. This can make a very large refresh a long transaction, but it gives the first release a clear consistency model: either the private evidence graph, MDM identity state, three public outputs, provenance, reviews, and source frontiers all commit together, or none of them do. Resumable work and checkpointed multi-transaction execution are V2 capabilities.
 
-**New entity.** Allocate a time-ordered UUID using the supported PostgreSQL generator.
+A refresh proceeds as follows:
 
-**Unchanged component.** Keep its existing `mdm_id`.
+1. The coordinator acquires the entity row lock and an entity-scoped advisory transaction lock. It pins the desired definition version, active publication revision, stewardship decision epoch, private graph generation, stream-table specification digests, and semantic engine versions.
+2. It invokes the strict `pg_trickle` graph refresh inside the same transaction. The returned result identifies the coherent source boundaries, the action taken by each private stage, and whether the terminal evidence delta is incremental or a full invalidation.
+3. It consumes the terminal evidence delta and seeds an affected set with changed source records, changed or removed pair edges, changed authoritative values, changed golden candidates, and any stewardship decisions made since the active publication.
+4. It adds every old component containing a seeded source record, every component reached by a new accepted edge, and every previously rejected bridge whose component context may now have changed. The resolver expands this closure to a fixed point.
+5. If the closure cannot be proved complete, if a candidate channel overflowed, if required dependency state is missing, or if `pg_trickle` reports full invalidation, the resolver broadens to the complete entity. Resource pressure may cause this broader work to fail, but it may not produce a partial publication.
+6. The resolver reclusters the complete affected set, reconciles stable IDs against the durable identity ledger, recomputes affected golden values and reviews, validates all invariants, and computes the logical row-level changes to the three public output tables.
+7. Before publication, it verifies that the pinned definition, decision epoch, graph generation, and base publication revision still match. Because the entity row is locked, a mismatch should be exceptional, but the compare-and-swap check remains part of the contract.
+8. It applies only the logical inserts, updates, and deletes needed to transform the public base tables, stores provenance and identity history, acknowledges the consumed `pg_trickle` delta, advances the publication revision, and commits.
 
-**Merge.** The oldest existing `mdm_id` survives. Break equal creation-time ties by UUID byte order. Retain aliases from retired IDs to the survivor.
+The affected closure is an optimization, not an alternative meaning of the entity. The reference semantics are a full resolver over the complete terminal evidence relations, active decisions, and existing identity ledger. For the same pinned inputs, an incremental refresh must produce the same memberships, stable-ID reconciliation, golden values, and reviews as that full resolver. Every built-in candidate channel and every definition-change class must pass differential tests that compare incremental sequences with full recomputation after inserts, updates, deletes, edge additions, edge removals, merges, splits, and stewardship changes.
 
-**Split.** The child containing the oldest surviving source member keeps the old `mdm_id`. Source-member age is its first published membership time. Break ties by `(source, source_id)`. Other children receive new IDs and retain `split_from` history.
+A no-change refresh records a new observation boundary and associates it with the active semantic publication, but it does not create a new semantic publication revision when memberships, goldens, reviews, aliases, and identity history are unchanged. The original publication manifest remains immutable; `mdm.describe()` distinguishes the frontier at which the revision was first published from the later frontier through which the same result has been proven equivalent. Different entities may refresh concurrently. Only one refresh, rebuild, or activation for a particular entity may execute at a time.
 
-**Deletion and reappearance.** Retain a source-record tombstone. If the same stable source key reappears, reactivate that source-record identity and resolve it through normal evidence.
-
-These rules are deterministic and versioned. Rebuild uses the same identity ledger and must reproduce the same IDs for the same source state, definition, and decisions. Later continuity heuristics require an explicit semantic version and opt-in migration; they cannot reinterpret v1 publications.
-
----
-
-## 9. Golden records and provenance
-
-The engine selects each golden field independently. Source authority for identity does not automatically make that source authoritative for every output field.
-
-Every published golden value records:
-
-- `mdm_id`
-- field
-- selected value and normalized value
-- winning source and source ID, when source-selected
-- policy and policy version
-- deterministic tie-break reason
-- configuration and publication revision
-- custom selector fingerprint and contributing values, when computed
-
-`mdm.explain()` exposes this provenance subject to PostgreSQL permissions and field masking. Provenance is required even when optional detailed history has been pruned.
+`mdm_admin.rebuild()` runs the complete private graph and full reference resolver under the desired definition and active decisions. It uses the existing identity ledger, aliases, split history, and first-membership records, so it preserves IDs according to the V1 policy. A rebuild without the original identity ledger can reproduce memberships and golden values but cannot promise the same newly allocated UUIDs.
 
 ---
 
-## 10. Stewardship
+## 10. Stable source and entity identity
 
-V1 has three stewardship operations:
+The durable identity of a source record is the tuple `(entity, source, encoded source key)`. `pg_mdm` retains this identity after the row becomes inactive so that a later reappearance of the same key refers to the same source record. The public members table includes an opaque `source_record_id` and a canonical tagged JSON representation of the source key; stewardship and internal constraints use the durable internal identity rather than a temporary review row or a display string.
 
-```text
-MATCH
-NOT_MATCH
-golden override
-```
+Each active resolved entity has one durable `mdm_id`. New entities receive a time-ordered UUID from the supported PostgreSQL generator. An unchanged component keeps its existing ID. When components merge, the ID with the earliest creation publication survives, with UUID byte order as the final tie break, and every retired ID becomes an alias of the survivor. Alias chains resolve transitively to the current canonical result, while each individual historical link remains retained for explanation.
 
-`MATCH` and `NOT_MATCH` attach to durable source-record identities, not temporary review rows. They survive refresh and become inactive while a source record is deleted. A golden override attaches to one `mdm_id` and field.
+When one component splits, the child containing the active source record with the earliest first-published membership keeps the old `mdm_id`. Ties are broken by canonical encoded source-record identity. Every other child receives a new ID and records `split_from` history. This policy is intentionally simple; weighted continuity, canonical ID locks, and planned split workflows belong in V2.
 
-Stewardship writes use optimistic concurrency and require a reason. `MATCH` and `NOT_MATCH` for the same pair cannot both remain active. The engine also rejects a `MATCH` whose must-link closure would contain an active `NOT_MATCH`. It returns the shortest contradiction chain it can produce.
+`mdm.explain()` provides a machine-readable identity-resolution result for any retained `mdm_id`. It reports `active`, `merged_into`, `split_into`, `retired`, or `unknown`, together with current successor IDs and the relevant publication revisions. A merge has one canonical successor. A split may have several successors and therefore is never represented as a simple alias.
 
-V1 does not expose direct merge, partitioned split, move-member, lock, unlock, or invariant-override commands. Stewards express identity corrections through pair decisions and edit or supersede those decisions when needed.
+The same source state, definition, decisions, and identity ledger produce the same reconciliation result. This guarantee does not claim that two independently initialized databases allocate identical first-time UUIDs. It claims that rebuild and subsequent refresh preserve and transform an existing durable identity ledger according to the pinned rules.
 
 ---
 
-## 11. Output contract
+## 11. Golden records and overrides
 
-### 11.1 `mdm_out.<entity>`
+The engine selects each golden field independently after clustering. This field-level survivorship model may produce a golden record whose values did not all coexist in one source row, and the documentation must state that plainly. Users who require coherent record-level survivorship need a later policy rather than assuming that independently selected fields describe one historical source version.
 
-One row per active `mdm_id`, with typed golden fields where practical. Standard metadata includes `mdm_id`, `member_count`, `has_review`, and `publication_revision`.
+The V1 built-in policies have complete tie semantics. `prefer_source` evaluates sources in the declared order, then prefers a valid candidate with the greatest declared row-change time when one is available, and finally uses canonical source-record order. `latest` requires every participating source to map a trustworthy, mutually comparable `row_changed_at` value; it orders by that value, declared source priority, and canonical source-record identity. `first_non_null` uses declared source order and canonical source-record order. `most_common` counts equal normalized values across active members, breaks count ties by the number of authoritative contributors, then by source priority and canonical normalized bytes, and chooses the published spelling from the highest-priority contributing record. A deterministic choice may still create a review when the winning margin is tied or when authoritative values are invalid.
 
-### 11.2 `mdm_out.<entity>_members`
+A golden override is a steward-supplied value for one field with a required anchor `source_record_id`. The override follows the component containing its anchor through ordinary merges and splits, which avoids attaching a human value to whichever child happens to inherit an old `mdm_id`. If the anchor becomes inactive, the override becomes inactive and the normal policy is used with a review notice. If two different active overrides for the same field arrive in one component after a merge, the entity membership may still publish, but that golden field is published as `NULL` with an override-conflict review until a steward clears or supersedes one directive.
 
-The current identity map:
-
-```text
-(source, source_id) -> mdm_id
-```
-
-At minimum it contains `source`, `source_id`, `mdm_id`, active status, first and last published revision, and a concise membership reason. Each active source record maps to exactly one active `mdm_id`.
-
-### 11.3 `mdm_out.<entity>_review`
-
-The review queue contains unresolved ambiguous pairs, authoritative identity conflicts, conservative bridge rejections, split notices, golden ties, invalid authoritative values, candidate incompleteness, and custom-function failures.
-
-Each row has a stable `review_id`, status, severity, subject references, reason code, masked summary, publication revision, and optimistic concurrency version.
-
-### 11.4 No v1 change feed
-
-V1 does not publish `<entity>_changes`. Consumers can use PostgreSQL triggers, logical decoding, or ordinary CDC against the three output relations. A future semantic feed must define merge, split, alias, golden, review, ordering, retention, and replay behavior as one complete contract.
+Every golden output, including an override and a deliberate `NULL` caused by conflict, stores provenance and a status. Provenance is protected by PostgreSQL permissions and the field display policy. V1 stores the winning raw value and the minimal contributing facts needed to explain the current and immediately previous publication; it does not promise indefinite retention of every non-winning raw source value.
 
 ---
 
-## 12. Incremental processing and publication
+## 12. Stewardship and review
 
-The engine stores source-row fingerprints, normalized values, candidate dependencies, accepted pair evidence, active decisions, current components, memberships, golden values, and publication revisions.
+V1 has three stewardship operations: `MATCH`, `NOT_MATCH`, and anchored golden override. Pair decisions attach to durable source-record identities and survive refresh. They become inactive while either source record is inactive and become eligible again if that record reappears. Every write records the actor, reason, creation revision, superseded directive when applicable, and an optimistic concurrency version.
 
-A changed record invalidates only dependent normalized values and candidate evidence. The affected closure includes its old component and any component reached by a new accepted candidate. Removing an accepted edge includes the complete old component because it may split. Adding an edge includes both components because they may merge.
+`mdm_steward.decide()` rejects a `MATCH` whose must-link closure contains an active `NOT_MATCH`, and it returns a bounded contradiction chain that identifies the decisions that must be changed. `MATCH` deliberately overrides automatic evidence, including an authoritative identity conflict, but never overrides an active `NOT_MATCH`. `NOT_MATCH` is enforced at component level, so no sequence of automatic or manual unions can place the prohibited pair in one published entity.
 
-The engine escalates to a full entity scan when:
+The review queue contains unresolved ambiguous pairs, authoritative identity conflicts, conservative bridge rejections, golden ties, invalid authoritative values, anchored overrides whose source record became inactive, override conflicts, and split notices. Candidate overflow and incomplete required evidence are operation failures rather than reviews because V1 does not publish a result derived from truncated search.
 
-- a `snapshot` source must prove deletions
-- a definition change alters a global match rule
-- the affected closure cannot be bounded safely
-- stored dependency state is missing or invalid
+A review has a stable issue key built from the entity definition version, reason code, and canonical subject identities. The first occurrence receives a stable `review_id`. If the same issue disappears, the review becomes resolved; if it recurs under the same semantic definition and subjects, the same review is reopened with a new occurrence version. A changed definition or materially different subject produces a new issue. Review writes use optimistic concurrency so a steward cannot unknowingly act on a stale explanation.
 
-Long-running work may use staging tables and multiple internal transactions, but publication is one short transaction. Failed work never becomes visible. V1 does not promise resumable work after process or primary failure; callers start a new refresh.
-
-`mdm_admin.rebuild()` is the recovery escape hatch. It resolves all current source records under the desired definition and active decisions, then publishes through the same atomic path. It preserves stable IDs through the v1 reconciliation rules.
+V1 does not expose direct merge, partitioned split, move-member, identity lock, field lock, bulk action, or invariant-override commands. Stewards express identity corrections through durable pair decisions. The absence of direct split tooling is intentional: a steward can add the necessary `NOT_MATCH` decisions, but workflows that describe an entire target partition belong in V2.
 
 ---
 
-## 13. PostgreSQL-native architecture
+## 13. The five actions
 
-V1 uses four schemas:
+### 13.1 `mdm.create()`
+
+`mdm.create()` validates and stores a complete immutable definition. Validation checks the source relation types, entity execution role, grants, row-security behavior, source-key constraints, mapped column types, built-in cleaner and comparator options, authoritative field usage, candidate-plan completeness, public output compatibility, golden-policy inputs, and the supported `pg_trickle` integration version. It compiles the canonical private graph and creates a paused graph generation transactionally. It does not change the active public entity until `mdm.refresh()` successfully activates the desired version.
+
+The operation stores the user definition, expanded definition, semantic digest, creator, execution role, comment, parent version, compiled logical candidate plan, private graph specification digests, and semantic version manifest. If graph creation or validation fails, the new version is not left partially installed.
+
+### 13.2 `mdm.describe()`
+
+`mdm.describe()` explains both the user model and the operational state. It shows the concise and fully expanded definitions, active and desired versions, public schema compatibility, source modes and boundaries, change and deletion completeness, execution role, fields and masking policies, match roles and evidence groups, the logical candidate plan and hard limits, private graph health and specification digests, active publication revision, earliest retained explanation revision, pending definition or stewardship work, entity and review counts, last successful refresh, and any blocking error.
+
+Entity status is one of `unpublished`, `current`, `pending`, `stale`, or `unknown`. `current` means that the active definition and decisions are published through the recorded source boundaries and no later change is currently known. `pending` means a later source, definition, or decision change is known. `stale` means such work is known and the latest refresh failed. `unknown` normally means a snapshot source cannot determine whether later changes exist without another complete scan. These labels never replace the detailed per-source boundaries.
+
+### 13.3 `mdm.preview()`
+
+`mdm.preview()` has three explicitly labeled modes. `validation` expands and compiles the definition without resolving records. `sampled` runs a deterministic diagnostic sample and reports examples of pair decisions, candidate-block sizes, expected work, and local membership changes; it does not claim statistically representative global merge, split, or review counts. `exact` resolves only explicitly supplied source records or `mdm_id` values through the same pair-decision, clustering, stable-ID, and golden logic used by refresh, but in isolated temporary state.
+
+Preview never advances a `pg_trickle` frontier, changes the desired or active definition, writes stewardship decisions, or publishes outputs. A complete exact preview of the entire entity, labeled regression suites, precision and recall reports, schema inference, and broad stewardship impact simulation are V2 work.
+
+### 13.4 `mdm.refresh()`
+
+`mdm.refresh()` refreshes the private evidence graph and publishes one complete MDM revision under the transaction model in Section 9. The caller may request the desired definition or require that a particular version still be desired. The result reports the source boundaries, graph actions, changed source records, pair-edge changes, affected component count, merges, splits, stable-ID outcomes, golden changes, review changes, publication revision, stage timings, and whether the resolver used local incremental work or the full reference path.
+
+A refresh that cannot prove source completeness, candidate completeness, graph-version compatibility, decision coherence, or final invariants fails before public output changes. The prior complete publication remains readable.
+
+### 13.5 `mdm.explain()`
+
+`mdm.explain()` accepts a source record, pair, active or retired `mdm_id`, golden field, review item, or retained publication revision. It returns structured facts and a readable explanation: normalized values, candidate-discovery channels, pair evidence, manual decisions, authoritative conflicts, accepted and rejected component unions, stable-ID survival, aliases and split successors, golden provenance, and review lifecycle as relevant.
+
+When a pair was not generated, explain reports which pinned logical candidate predicates it failed. It may run one bounded on-demand comparison for diagnostics, but the result is labeled diagnostic and does not change the publication or imply that all omitted pairs were examined. Historical explanation is by immutable publication revision, not business-valid time. V1 guarantees enough retained facts to explain the current and immediately previous successful publication and reports any longer implementation-specific retention window through `describe()`.
+
+---
+
+## 14. Public output contract
+
+The three public outputs are logged PostgreSQL base tables with stable names. They are not views over a private revision pointer, because V1 explicitly supports ordinary row triggers, logical decoding, and standard PostgreSQL CDC against the named outputs. Publication applies a logical row-level diff inside one transaction and never implements a normal rebuild as `TRUNCATE` followed by complete reinsertion.
+
+### 14.1 `mdm_out.<entity>`
+
+This table contains one row per active `mdm_id`. Its primary key is `mdm_id`, followed by the typed golden columns in their stable creation order. Standard metadata includes `member_count`, `has_review`, `publication_revision`, and `golden_status` metadata available through explanation. New golden columns may be appended by a later active definition, but existing public column names, positions, and types remain stable throughout V1.
+
+### 14.2 `mdm_out.<entity>_members`
+
+This table is the durable source-to-entity map. It contains `source_record_id`, source name, canonical tagged `source_id` JSON, current or last `mdm_id`, active status, first and last published membership revisions, concise membership reason, and publication revision. Every active source record maps to exactly one active `mdm_id`. Inactive source records may remain visible as tombstones so old source references can be explained; their stored `mdm_id` is the last published ID and may resolve through merge or split history.
+
+### 14.3 `mdm_out.<entity>_review`
+
+This table contains the current review queue and the limited retained status needed for optimistic stewardship. Each row has `review_id`, issue key, status, severity, reason code, subject references, masked summary, first and last occurrence revisions, publication revision, and concurrency version. Raw sensitive values are absent unless the reader has the relevant source and field permissions and requests them through `mdm.explain()`.
+
+### 14.4 Ordinary CDC, not a semantic change feed
+
+Consumers may use triggers or logical decoding on the three public base tables and will observe one transactionally complete MDM publication. This is ordinary row-level database change capture. It does not explain that an ID retired because of a merge, that one parent split into several children, or that a golden change came from a particular stewardship action. A semantic `<entity>_changes` feed with ordered merge, split, alias, replay, retention, and resynchronization behavior remains a V2 feature.
+
+---
+
+## 15. PostgreSQL architecture, security, and operations
+
+V1 uses the following schemas:
 
 ```text
 mdm
@@ -553,91 +440,54 @@ mdm_steward
 
 mdm_admin
   rebuild
+  drop_entity
 
 mdm_internal
-  extension-owned catalogs and work tables
+  definitions, operations, identity ledger, provenance,
+  review history, private graph registry, and resolver work tables
 ```
 
-Ordinary roles have no direct access to `mdm_internal`. Entry points resolve relation and function identifiers through PostgreSQL catalogs, use a fixed safe `search_path` where security definer behavior is required, and enforce PostgreSQL grants on source, output, review, and explanation data.
+Each entity captures an execution role at creation. That role must have the required `SELECT` privileges on its sources and remains the identity under which private defining queries are evaluated, including row-level security. `pg_mdm` security-definer entry points use a fixed safe `search_path`, separate privileged bookkeeping from source-query execution, and fail when the execution role loses required access. Ordinary roles have no direct access to `mdm_internal` or to generated private stream tables.
 
-V1 provides grant guidance for administrators, configurators, stewards, and readers. It does not create a multi-tenant authorization system.
+Administrators grant distinct capabilities to configurators, stewards, output readers, and explanation readers. Field display policy controls whether sensitive values appear as `full`, `masked`, or `hashed` in review and explanation. Logs contain entity IDs, source-record IDs, reason codes, counts, and digests rather than raw source values. The private graph and normalized values are sensitive database state and must be included in access reviews and backup protection.
 
-Raw sensitive values are kept only where golden output, review, or provenance needs them. Logs use IDs, reason codes, counts, and digests. Fields may be `masked`, `hashed`, or `full` in review and explanation output according to grants.
+The initial implementation inherits the deployment requirements of its supported `pg_trickle` release, including its PostgreSQL major-version target, preload requirements, and privileged extension installation. `pg_mdm` pins and tests a compatible release line rather than accepting an arbitrary newer version. It uses only the stable extension-to-extension SQL contract and treats a changed or missing contract as an explicit compatibility failure.
 
----
+Every create, preview, refresh, rebuild, stewardship write, and destructive lifecycle operation receives an operation ID. A successful operation record commits with the operation and includes a stable MDM result code, concise outcome, source boundaries, graph actions, row and pair counts, affected components, identity changes, golden and review changes, stage timings, and semantic versions as relevant. After a rollback, the invoking scheduler or coordinator records failure context in a new transaction when possible; no semantic guarantee depends on failed-attempt logging surviving. V1 does not promise a formal SLO, but documentation provides a tested operating envelope for source rows, candidate-block sizes, component sizes, expected storage amplification, and publication transaction size.
 
-## 14. Custom functions
+The durable state that must survive backup and restore includes definitions, source-record identities and tombstones, stewardship directives, the `mdm_id` ledger, aliases and split history, active memberships, publication metadata, golden provenance, and retained review facts. Private `pg_trickle` relations are derived but are normally backed up with the database. If they are missing or invalid after restore, `mdm_admin.rebuild()` recreates them and uses the durable MDM ledger to restore current output. V1 relies on ordinary PostgreSQL backup, point-in-time recovery, streaming replication, and resource controls; automated restore verification and checkpoint resume are deferred.
 
-V1 supports three registered PostgreSQL function types:
-
-```sql
-(raw_value anyelement, options jsonb) -> mdm.cleaned_value
-
-(left mdm.cleaned_value, right mdm.cleaned_value, options jsonb)
-    -> mdm.match_evidence
-
-(candidates mdm.golden_candidate[], options jsonb)
-    -> mdm.golden_choice
-```
-
-These correspond to custom cleaners, comparators, and golden selectors. Registration verifies the exact signature, return type, volatility, ownership, parallel-safety declaration, option schema, and function definition fingerprint. Functions must be deterministic and side-effect free.
-
-V1 custom functions may depend only on their arguments, immutable PostgreSQL functions, and pinned literal options. Relation lookups, network access, clock time, random state, custom candidate generation, and custom component checks are unsupported. Replacing a registered function body requires a new entity definition version before refresh.
-
----
-
-## 15. Operations and errors
-
-Each preview, refresh, rebuild, configuration change, and stewardship write has an operation record. Refresh records source counts, changed records, deleted records where knowable, candidates, pair classifications, affected components, entity changes, review changes, publication revision, stage timings, and failure detail.
-
-`mdm.describe()` reports an entity as:
-
-- `current` when all sources visible to the last refresh are published and every source has proven deletion completeness
-- `current_with_unknown_deletions` when change rows are processed but at least one `changed_at` source cannot reveal hard deletes
-- `pending` when known source changes exist
-- `stale` when refresh failed after known changes
-- `unknown` when source state cannot be checked without a scan
-
-Errors use a stable MDM code, a concise message, a concrete consequence, and a next action. Candidate explosion, non-unique keys, unsafe custom functions, incompatible mapped columns, contradictory decisions, stale review versions, and failed publication validation stop before changing public output.
-
-V1 relies on normal PostgreSQL backup, point-in-time recovery, streaming replication, monitoring, scheduling, and resource controls. Extension documentation must identify durable extension tables that backups must include. Automated restore verification, recovery objectives, fair scheduling, run checkpoint recovery, and extension-managed storage retention remain v2 work.
+`mdm_admin.drop_entity()` provides explicit entity lifecycle cleanup. It removes the private graph and public outputs and requires a privileged caller plus an explicit destructive confirmation. Entity rename is not supported in V1 because the entity name is part of the stable output contract.
 
 ---
 
 ## 16. V1 invariants
 
-These eight invariants define the first release more strongly than any table layout or implementation choice.
+These invariants define V1 more strongly than any private table layout or Rust module boundary.
 
-1. **Atomic publication.** Memberships, entities, golden values, reviews, and required provenance from one revision become visible together or not at all.
-2. **No silent candidate incompleteness.** An incomplete bounded search produces review or failure, never proof of non-match.
-3. **No implicit deletion.** Absence removes a source record only in `snapshot` mode after a complete scan. Other modes require their declared deletion signal.
-4. **Deterministic, versioned semantics.** The same source state, expanded definition, function fingerprints, decisions, and identity ledger produce the same memberships, IDs, goldens, and reviews.
-5. **Coherent manual decisions.** Active must-link and cannot-link decisions cannot contradict one another.
-6. **Unique active membership.** Each active `(source, source_id)` maps to exactly one active `mdm_id` within an entity.
-7. **Golden provenance.** Every published golden value identifies its source or deterministic computation.
-8. **Resource pressure never changes truth.** Limits may delay work, broaden work, produce review, or fail. They cannot skip evidence, weaken constraints, or publish partial output.
+1. **Proven source boundary.** A publication names the complete `pg_trickle` frontier or snapshot boundary from which its evidence was derived. Unknown or incompatible source state cannot be published as complete.
+2. **Atomic publication.** Private graph advancement, memberships, entities, golden values, reviews, required provenance, identity history, and publication metadata commit together or not at all.
+3. **Incremental/full equivalence.** For the same source boundary, expanded definition, decisions, identity ledger, and semantic versions, incremental refresh produces the same semantic result as the full reference resolver.
+4. **Complete logical candidate enumeration.** Every pair inside the pinned logical candidate predicates is enumerated completely, or the refresh fails. A truncated search is never evidence of non-match.
+5. **Deterministic, versioned semantics.** Cleaner behavior, candidate predicates, pair decisions, edge order, component admission, stable-ID reconciliation, and golden tie breaks are versioned and use complete total ordering.
+6. **Coherent manual constraints.** An active must-link closure cannot contain an active cannot-link. `MATCH` overrides automatic evidence but never an active `NOT_MATCH`.
+7. **Conservative component admission.** An automatic union must satisfy both pair evidence and the documented component-level rule; a one-edge chain cannot grow an established component indefinitely.
+8. **Unique active membership.** Each active source record maps to exactly one active `mdm_id` within an entity.
+9. **Durable identity continuity.** Merges retain one canonical successor, splits retain all successors, and retained IDs have a machine-readable resolution through `mdm.explain()`.
+10. **Golden provenance.** Every published golden value or conflict `NULL` identifies its policy, inputs, decision status, and publication revision.
+11. **Resource pressure fails closed.** Memory, disk, time, candidate, or component limits may broaden work or reject the refresh. They may not lower evidence requirements, skip required pairs, or publish partial output.
+12. **`pg_trickle` encapsulation.** No V1 guarantee depends on reading or mutating a private `pg_trickle` catalog, buffer, generated column, or storage layout.
 
 ---
 
 ## 17. Acceptance criteria
 
-V1 is ready when a user can:
+V1 is ready when a user can define one entity over several supported PostgreSQL relations, use tracked, soft-delete, and complete-snapshot sources, map scalar or supported composite source keys, normalize common identity fields with built-in cleaners, express exact and fuzzy identity, strong, and supporting evidence, and understand the compiled candidate plan before publication. The system must resolve records without an all-pairs comparison, prevent incomplete candidate work from masquerading as non-match, publish conservative components with stable IDs, and expose golden records, membership, and review through ordinary SQL tables.
 
-- define one entity over multiple PostgreSQL relations
-- use `snapshot`, `soft_delete`, and `changed_at` sources with honest deletion completeness
-- map logical fields and normalize values without changing source relations
-- express exact and fuzzy identity, strong, and supporting evidence
-- resolve records without an all-pairs comparison
-- receive deterministic conservative clusters and stable `mdm_id` values
-- query golden, membership, and review relations
-- trace every golden value to its source or selector inputs
-- record durable `MATCH`, `NOT_MATCH`, and golden override decisions
-- preview validation, work, and representative local changes without publication
-- explain records, pairs, entities, golden fields, and review items
-- process inserts, updates, proven deletions, disappearing edges, local merges, local splits, and golden-only changes incrementally
-- fall back to broader work when local completeness cannot be proven
-- publish atomically and repeat a no-change refresh without semantic changes
-- rebuild current state while preserving IDs under the documented rule set
-- reject incomplete, contradictory, non-deterministic, or resource-unsafe work before publication
+A steward must be able to record durable `MATCH`, `NOT_MATCH`, and anchored golden overrides with optimistic concurrency and explanations. The resolver must enforce cannot-link closure, make the precedence of manual and automatic evidence visible, prevent singleton chain accretion under the documented component policy, preserve IDs across no-op refreshes and documented merge and split cases, and resolve retired IDs through machine-readable explanation.
 
-V1 is not blocked on any capability listed in Section 1.2. Shipping those capabilities early is allowed only when they remain private implementation details and do not enlarge the public compatibility promise.
+The `pg_trickle` integration must prove that strict graph refresh, source frontier advancement, terminal deltas, full invalidation, and MDM publication share one commit boundary. Tests must cover concurrent source writes, concurrent refresh attempts, rollback after private graph maintenance, differential-to-full fallback, source deletes, snapshot disappearance, schema change, unsupported integration versions, and restore followed by rebuild. No code path may advance a consumed frontier while leaving the corresponding public MDM revision uncommitted.
+
+The implementation must maintain a slow full reference resolver and compare it with incremental behavior under generated sequences of inserts, updates, deletes, decision changes, edge appearance and disappearance, local merges, local splits, golden-only changes, and graph full fallback. A no-change refresh must not create a semantic publication, and a rebuild with the original identity ledger must preserve every ID required by the V1 policy.
+
+V1 is not blocked on generic foreign tables, `changed_at` polling, custom SQL functions, approximate nearest-neighbor search, exact global impact preview, labeled precision and recall suites, direct entity merge and partitioned split workflows, locks and bulk stewardship, downstream MDM dependency graphs, semantic change feeds, valid-time history, namespaces, quotas, resumable work, configurable retention, restore verification, or formal service objectives. Shipping any of those capabilities early is acceptable only when they remain private implementation details and do not enlarge or weaken the compatibility contract described here.
