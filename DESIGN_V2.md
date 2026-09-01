@@ -43,6 +43,8 @@ V2 is where the system may become suitable for larger organizations, more varied
 | Execution | One synchronous outer transaction with full-entity MDM resolution | Proven affected-set resolution and optional prepared, checkpointed, resumable runs with an atomic final promotion |
 | Operations | One administrative scope using PostgreSQL controls | Namespaces, quotas, fairness, service objectives, restore verification, retention policies, and deeper health diagnostics |
 
+Optional capabilities compose through an explicit dependency graph. Each entity manifest pins every enabled capability and version, and the compiler rejects missing, disabled, or incompatible prerequisites before source work begins. For example, prepared execution requires the corresponding `pg_trickle` generation and promotion contract; valid-time projections require retained source versions and a historical identity mode; and resolved entities as sources require the semantic-feed replay, retention, and resynchronization contract. `mdm.describe()` reports the enabled capabilities, their prerequisites, and any capability for which the entity is ineligible. An optional capability may be unavailable; it may not silently degrade into a weaker result.
+
 No V2 feature may weaken the V1 fail-closed rules. A richer source adapter cannot turn an unproven watermark into completeness. A custom candidate generator cannot use truncation as proof of non-match. A bulk stewardship action cannot accept an incompletely evaluated population. A workload budget cannot lower a match threshold. More capability means more explicit contracts, not more opportunities to guess.
 
 ---
@@ -107,13 +109,13 @@ The V1 modes become named presets for this larger model:
 | `soft_delete` | A tracked current relation with a retained lifecycle predicate in addition to hard-delete capture |
 | `snapshot` | A complete replacement relation with a snapshot identifier that proves the scanned row scope is complete |
 
-V2 may additionally support an `ordered_changes` contract. This contract consumes an append-only or update-safe local landing relation whose rows contain a stable event ID, source-record key, total source order or declared partial order, lifecycle action, payload or changed fields, and a completeness watermark. The watermark means that every event in the declared source scope through that boundary has been delivered; it is not merely the greatest timestamp seen. Duplicate delivery is a no-op, and a correction explicitly names the source event or source version it supersedes.
+V2 may additionally support an `ordered_changes` contract. This contract consumes an append-only or update-safe local landing relation whose rows contain a stable event ID, source-record key and incarnation, a source sequence that totally orders events for that record, lifecycle action, payload or changed fields, and a completeness watermark. A global order across independent records is not required. Events for one source-record incarnation that cannot be totally ordered are rejected; arrival order and timestamps are not tie breaks. The watermark means that every event in the declared source scope through that boundary has been delivered; it is not merely the greatest timestamp seen. Duplicate delivery is a no-op, and a correction explicitly names the source event or source version it supersedes.
 
 External systems are normally integrated by landing their snapshots or change events in local PostgreSQL relations and letting `pg_trickle` maintain the downstream facts. A direct foreign or distributed relation may be accepted only through a provider capability that proves how data, snapshot position, and completeness belong together. If one complete snapshot cannot cover every relation involved in a source contract, the source is reported as unaligned and cannot support a publication that claims complete current state.
 
 V2 may distinguish lifecycle states such as `active`, `deleted`, `deactivated`, `superseded`, `temporarily_absent`, and `outside_scope`. Each state has an explicit effect on matching eligibility, current membership, golden-value eligibility, history, and reappearance. A record that temporarily leaves an extract must not become deleted merely because it is missing, and a record outside a newly narrowed scope must not be confused with a source-level delete. Changing row scope is therefore a semantic definition change and usually requires a complete reconciliation.
 
-Key reuse remains forbidden by default. A source that legitimately reuses keys must provide a source generation, incarnation, or version boundary that makes the new record distinguishable from the prior source-record identity. The generated identity becomes part of the source contract and must be available to stewardship and historical explanation. Guessing that a reappearing key represents the same real-world record is never acceptable.
+Key reuse remains forbidden by default. A source that legitimately reuses keys must provide a source generation, incarnation, or version boundary that makes the new record distinguishable from the prior source-record identity. The generated identity becomes part of the source contract and must be available to stewardship and historical explanation. Adopting key reuse for an existing source is an incompatible source-identity migration unless every retained source record can be assigned an incarnation without ambiguity. Each retained `source_record_id`, directive anchor, and historical reference remains bound to one explicit incarnation; later incarnations receive new source-record IDs. If that binding cannot be proved, activation is rejected. Guessing that a reappearing key represents the same real-world record is never acceptable.
 
 ---
 
@@ -126,6 +128,8 @@ The system may expose three related times. `publication_revision` identifies an 
 A late correction creates a new source version and eventually a new MDM publication. It may change what the current system believes was effective at an earlier business time, but it never rewrites an old publication. A query for “what did we publish at revision 120?” returns the immutable result from revision 120. A query for “what does revision 180 now say was valid on 2025-06-01?” may return a corrected historical projection, clearly labeled as a current belief evaluated from revision 180.
 
 Point-in-time membership and golden projections are optional V2 surfaces rather than changes to the three current-state outputs. An implementation may expose functions or tables under an `mdm_history` schema, but every answer includes the publication revision used as knowledge, the requested valid time, and a completeness status. If required source versions, evidence, or identity history have expired, the query returns `incomplete_history` with the missing horizon instead of inventing an answer.
+
+Historical identity is explicit. A projection that reproduces an actual publication returns the durable `mdm_id` values from that publication. A corrected valid-time partition that never existed as a publication uses a projection-scoped `historical_component_id` derived under the pinned historical policy. It may report related durable IDs for explanation, but it does not create aliases, claim stable-ID continuity, or mutate the current identity ledger. The identifier is meaningful only with its knowledge revision, requested valid time, and definition version.
 
 Valid-time resolution can be expensive because a correction may change candidate evidence, clusters, and golden values across an interval. `pg_trickle` may maintain source-version and interval relations incrementally, while `pg_mdm` computes affected historical components under the same deterministic policies used for current state. A deployment may choose to retain source versions without enabling full historical clustering, or may enable history only for named entities or fields. The advertised history capability must match what the retained data can actually answer.
 
@@ -172,7 +176,7 @@ Stewardship preview also becomes richer. Before a merge, split, move, lock, or b
 
 ## 9. Registered semantic extensions
 
-V1 deliberately ships only extension-owned cleaners, comparators, and golden selectors. V2 may add registered semantic extensions for deployments whose identity rules cannot be represented safely with the built-ins. Custom behavior is accepted only through narrow function contracts whose inputs, outputs, dependencies, resource bounds, and versioning are fully declared.
+V1 deliberately ships only extension-owned cleaners, comparators, and golden selectors. V2 may add registered semantic extensions for deployments whose identity rules cannot be represented safely with the built-ins. Custom behavior is accepted only through narrow function contracts whose inputs, outputs, dependencies, resource bounds, and versioning are fully declared and statically verifiable.
 
 Illustrative contracts include:
 
@@ -193,9 +197,9 @@ Illustrative contracts include:
     -> mdm.golden_choice
 ```
 
-These functions correspond to cleaners, pair comparators, bounded candidate-key generators, component checks, and golden selectors. Registration records the exact signature, owner, language, volatility, parallel-safety declaration, option schema, output cardinality, cost class, maximum input and output size, deterministic test vectors, body fingerprint, transitive function dependencies, supported PostgreSQL versions, collation dependencies, and any required extension versions. Unknown or changed dependencies block refresh until a new definition version is created.
+These functions correspond to cleaners, pair comparators, bounded candidate-key generators, component checks, and golden selectors. Registration records the exact signature, owner, language, volatility, parallel-safety declaration, option schema, output cardinality, cost class, maximum input and output size, deterministic test vectors, canonical executable fingerprint, statically resolved transitive function dependencies, supported PostgreSQL versions, collation dependencies, and any required extension versions. Unknown or changed dependencies block refresh until a new definition version is created.
 
-Custom code is trusted administrator code. Registration is restricted to privileged roles and allowlisted languages and schemas. Security-definer functions, functions with network access, undeclared relation lookups, clock access, random state, sequence use, session-state dependence, or side effects are rejected. A declared mutable lookup relation should normally be represented as an explicit source to the private `pg_trickle` graph and joined into the function's arguments, rather than queried invisibly from inside the function. This makes invalidation and source completeness visible.
+Administrator-provided code is eligible only when the registrar can inspect its executable form and resolve its complete transitive call graph. Registration is restricted to privileged roles and allowlisted languages, schemas, operators, casts, and callees. PostgreSQL volatility and parallel-safety declarations and deterministic test vectors are evidence for review, not proof of purity. Dynamic SQL, unresolved dispatch, opaque user-supplied native code, security-definer functions, network access, undeclared relation lookups, clock access, random state, sequence use, session-state dependence, and side effects are rejected. A declared mutable lookup relation should normally be represented as an explicit source to the private `pg_trickle` graph and joined into the function's arguments, rather than queried invisibly from inside the function. This makes invalidation and source completeness visible.
 
 A custom candidate-key function returns a bounded list of deterministic keys for one normalized record. It does not enumerate arbitrary pairs or control join order. A custom component check receives a bounded, versioned summary chosen by the engine and returns an accept, reject, or review result with reason codes; it does not mutate components or choose stable IDs. A custom golden selector chooses among supplied candidates and returns complete provenance; it does not query the network or write an external system.
 
@@ -234,6 +238,8 @@ Custom component checks can enrich a built-in policy, but there is no unrestrict
 V2 adds entity-level stewardship when pair decisions become too awkward for real operational work. The pair-level `MATCH`, pair-level `NOT_MATCH`, and anchored golden override remain valid primitives, but a steward may also request a merge of named entities, a split into an explicit member partition, movement of one source record to a target entity, a lock on identity or membership, a lock on one or more golden fields, or a narrowly scoped override of an automatic invariant.
 
 All stewardship actions append immutable directives. They never edit the three public output tables directly. A merge directive compiles to explicit membership requirements and planned ID continuity. A split directive names the complete intended partition of the current members and compiles to must-link and cannot-link constraints sufficient to preserve that partition. A move-member directive is represented as a bounded removal from one component and admission to another. Unlocking, clearing, or correcting an action supersedes an earlier directive rather than deleting history.
+
+Every merge, split, and move directive names an expected base publication revision and durable source-record identities. Entity IDs in the request are lookup handles resolved at that revision, not the stored subject of the directive. Acceptance expands the request against the complete base membership and stores the canonical compiled constraints and continuity plan. If membership changed since the named revision, the write fails and requires a new preview. A split constrains the named partition only; later source records follow the automatic policy unless a separate lock explicitly declares a future-membership scope. A lock states whether it protects a canonical ID, a fixed source-record set, or future membership. No directive acquires future scope merely because it named an entity that later merged, split, or gained members.
 
 V2 formalizes decision precedence:
 
@@ -286,6 +292,8 @@ Relation-backed selectors use declared source or lookup relations maintained thr
 V1 consumers can observe ordinary row changes on the three primary output tables. V2 may add `mdm_out.<entity>_changes` for consumers that need entity-aware events such as merges, splits, member moves, and canonical-ID transitions. The feed is generated by the MDM resolver from semantic before-and-after state; it is not reconstructed later by guessing from physical table diffs.
 
 Events are ordered by `(publication_revision, event_no)` and commit in the same transaction as the corresponding current-state publication. Every event has a stable event ID, entity name, publication revision, event number, event type, affected IDs, relevant source-record or field references, reason code, causal operation or directive, semantic policy versions, and non-sensitive before-and-after digests. Raw sensitive values are absent by default and appear only in a separately protected payload when an administrator explicitly enables them.
+
+The feed describes published semantic state, not the earlier control-plane transaction that accepted a directive or lock. Such a write makes the entity pending; its event appears only if and when a refresh publishes the resulting control state. When an enabled feed produces a semantic event, the refresh advances the semantic publication revision even if the three primary tables have no row changes. A refresh that only proves a later observation boundary emits no event and remains a V1-style no-change refresh.
 
 Candidate event types include:
 
@@ -417,7 +425,7 @@ Compaction may use validity intervals, append-only events, periodic checkpoints,
 
 Legal holds or investigation holds may freeze selected source records, entities, directives, publications, or event ranges. Holds prevent retention cleanup but do not by themselves change current identity. Access to held data remains subject to ordinary PostgreSQL authorization and namespace policy.
 
-Custom semantic functions and lookup relations are treated as sensitive execution dependencies. Registration, invocation, and explanation follow the namespace's trusted-code policy, and raw function errors are sanitized so they cannot leak values into logs. The execution role and search path remain pinned and explicit across normal, preview, prepared, and recovery paths.
+Custom semantic functions and lookup relations are treated as sensitive execution dependencies. Registration, invocation, and explanation follow the namespace's verified-code policy, and raw function errors are sanitized so they cannot leak values into logs. The execution role and search path remain pinned and explicit across normal, preview, prepared, and recovery paths.
 
 ---
 
@@ -449,7 +457,7 @@ The order below reflects technical dependencies rather than a requirement to shi
 
 ### 23.1 Reproducibility and prepared execution
 
-First add richer manifests, exact `pg_trickle` capability negotiation, immutable prepared graph generations, durable delta leases, and atomic promotion. These foundations make large exact preview, resumable refresh, and later operational features possible without weakening publication semantics.
+First add richer manifests, exact `pg_trickle` capability negotiation, immutable prepared graph generations, and atomic promotion. These foundations make large exact preview, resumable refresh, and later operational features possible without weakening publication semantics. Durable terminal deltas and their leases are not prerequisites for prepared full resolution; add them only with affected-set resolution after measurements justify that optimization.
 
 ### 23.2 Source depth and time
 
@@ -480,11 +488,11 @@ Every stage should remain removable until a real deployment depends on it. Exper
 V2 retains all twelve V1 invariants. When the associated capabilities are enabled, it adds the following invariants:
 
 13. **Canonical configuration expansion.** Presets, fragments, inferred proposals, and local declarations resolve to one canonical complete definition before semantic validation and graph compilation.
-14. **Every mutable semantic dependency is declared.** A function, model, lookup relation, collation, extension, source adapter, or setting cannot affect identity unless its version and invalidation contract appear in the manifest.
+14. **Every mutable semantic dependency is declared.** A function, model, lookup relation, collation, extension, source adapter, or setting cannot affect identity unless its version and invalidation contract appear in the manifest. Custom executable dependencies must also be statically inspectable and allowlisted.
 15. **Prepared evidence is immutable.** A resumable run resolves only the prepared graph generation and source boundaries named by its manifest; later changes remain pending and cannot leak into the run.
 16. **Prepared publication is atomic.** Promotion of the prepared `pg_trickle` generation, MDM current-state tables, identity history, reviews, provenance, and semantic events commits together or not at all.
-17. **Time axes are explicit.** Publication history, observation time, and business-valid time are never silently substituted for one another, and incomplete historical answers are labeled.
-18. **Stewardship directives are coherent.** Merge, split, move, pair decisions, locks, overrides, and golden instructions reduce to a contradiction-checked set of constraints; timestamps alone never decide precedence.
+17. **Time axes and historical identity are explicit.** Publication history, observation time, and business-valid time are never silently substituted for one another. Incomplete historical answers are labeled, and a recomputed historical partition cannot mutate or impersonate the durable current-state identity ledger.
+18. **Stewardship directives are coherent and durably scoped.** Merge, split, move, pair decisions, locks, overrides, and golden instructions name their base state and durable subjects and reduce to a contradiction-checked set of constraints; timestamps alone never decide precedence.
 19. **Identity continuity is explainable.** Every merge or split survivor is selected by a pinned policy or explicit lock and has a machine-readable successor history.
 20. **Semantic events are ordered and recoverable.** When the change feed is enabled, every current-state publication has a complete ordered event segment, and consumers can detect gaps and resynchronize.
 21. **Entity dependencies are acyclic and revision-bound.** Every downstream publication names the exact upstream publications it consumed, and missing dependency history causes broader work or failure rather than guesswork.
@@ -493,6 +501,7 @@ V2 retains all twelve V1 invariants. When the associated capabilities are enable
 24. **Namespace isolation is structural.** When namespaces are enabled, every identity, graph, run, decision, output, event, resource counter, and generated relation is scoped so that cross-namespace matching or disclosure cannot occur accidentally.
 25. **Operational policy never changes truth.** Worker count, fairness, deadlines, quotas, and service objectives may delay, pause, broaden, or reject work; they never weaken semantic rules or publish incomplete state.
 26. **Semantic upgrades are opt-in or explicit repairs.** Existing V1 and V2 definitions retain their pinned meaning until an administrator adopts a new semantic version or applies a documented mandatory correctness repair.
+27. **Capability prerequisites fail closed.** Every enabled capability and version appears in the entity manifest. Missing or incompatible prerequisites make the entity ineligible; they never produce a silently reduced result.
 
 ---
 
@@ -520,15 +529,15 @@ This table summarizes where the release boundary now sits.
 | Execution | One outer transaction with full-entity MDM resolution | Proven affected-set resolution and checkpointed multi-worker private work with one atomic final promotion |
 | Operations | PostgreSQL roles, locks, backup, replication, and resource controls | Namespaces, quotas, fairness, SLOs, verify, failover validation, and recovery workflows |
 | Storage | PostgreSQL-managed current and minimum explanation state | Data-class retention, legal holds, checkpoints, history compaction, and explicit capability downgrade |
-| Security | Execution roles, protected internals, masking | Namespace isolation, sensitivity-driven storage, trusted custom-code policy, digest-key management |
+| Security | Execution roles, protected internals, masking | Namespace isolation, sensitivity-driven storage, verified custom-code policy, digest-key management |
 
 ---
 
 ## 26. V2 acceptance
 
-V2 is acceptable when every implemented capability remains reachable through the five normal actions or a clearly privileged stewardship or administration function, leaves the three V1 primary outputs stable, preserves existing V1 definitions under their pinned semantic versions, publishes atomically, and provides a bounded explanation of its effect. A capability is not complete until its failure boundary, migration path, rollback or abandonment behavior, retention requirements, and interaction with incremental and full reference resolution are tested.
+V2 is acceptable when every implemented capability remains reachable through the five normal actions or a clearly privileged stewardship or administration function, leaves the three V1 primary outputs stable, preserves existing V1 definitions under their pinned semantic versions, publishes atomically, and provides a bounded explanation of its effect. The compiler must validate each capability's pinned prerequisites before source work begins. A capability is not complete until its failure boundary, migration path, rollback or abandonment behavior, retention requirements, and interaction with incremental and full reference resolution are tested.
 
-A source-contract feature must prove its boundary and lifecycle semantics. A valid-time feature must keep publication and business time distinct. A custom function must declare every dependency. A new clustering or continuity policy must be versioned and previewable. A stewardship operation must reduce to coherent constraints. A semantic feed must define order, replay, retention, gaps, and resynchronization. A downstream entity must pin upstream revisions. A resumable run must publish exactly the result of its immutable manifest or publish nothing.
+A source-contract feature must prove its boundary, per-record event order, lifecycle semantics, and any source-identity migration. A valid-time feature must keep publication and business time distinct and define the identity of every historical projection. A custom function must have a statically resolved and allowlisted dependency closure. A new clustering or continuity policy must be versioned and previewable. An entity-level stewardship operation must name its base publication and durable constraint scope. A semantic feed must define order, replay, retention, gaps, resynchronization, and no-change revision behavior. A downstream entity must pin upstream revisions. A resumable run must publish exactly the result of its immutable manifest or publish nothing.
 
 The test program must continue to compare incremental, prepared, resumed, and full-reference results under generated source changes, late events, corrections, definition changes, directives, locks, merges, splits, candidate overflow, worker failure, failover, retention boundaries, and `pg_trickle` upgrades. Physical execution choices may change, but memberships, ID continuity, goldens, reviews, semantic events, and explanations must remain equal for the same manifest.
 
