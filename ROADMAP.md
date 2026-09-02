@@ -2,11 +2,11 @@
 
 ## Purpose
 
-This roadmap divides the V1 design into testable development releases. The estimates assume one experienced engineer who is already familiar with PostgreSQL extension development, Rust, and `pg_trickle`. They are rough-order-of-magnitude ranges, not commitments, and include implementation, tests, documentation, review, and defect fixing. Their confidence is low until working code establishes delivery velocity.
+This roadmap divides the V1 design into testable development releases implemented sequentially by a coding agent with human review. Only one release is in progress at a time, and the next starts after the current release meets its exit evidence. The estimates are rough-order-of-magnitude ranges, not commitments, and include implementation, tests, documentation, review, and defect fixing. Their confidence is low until working code establishes delivery velocity.
 
 The roadmap follows [`DESIGN_V1.md`](DESIGN_V1.md). Each release should leave its completed behavior runnable and tested, while features assigned to [`DESIGN_V2.md`](DESIGN_V2.md) remain out of scope. In particular, V1 uses full-entity resolution over complete terminal evidence relations and does not wait for affected-set resolution or durable output deltas.
 
-This repository currently contains designs only. Before attaching calendar dates, v0.1 and v0.2 must establish the extension toolchain and test harness, and the remaining estimates must be revised from measured delivery. A milestone is complete only when its behavior is installed, runnable, and covered by its stated tests; design or partially wired code does not count. If a milestone exceeds its upper range, re-estimate the remaining work and move optional behavior to V2 rather than silently extending V1.
+This repository currently contains designs only. Implementation does not start until a released `pg_trickle` capability advertises stable `external_graph_refresh` major 1 and passes its conformance gate. Before attaching calendar dates, v0.1 and v0.2 must then establish the extension toolchain and test harness, and the remaining estimates must be revised from measured delivery. A milestone is complete only when its behavior is installed, runnable, and covered by its stated tests; design or partially wired code does not count. If a milestone exceeds its upper range, re-estimate the remaining work and move optional behavior to V2 rather than silently extending V1.
 
 ## Development releases
 
@@ -50,7 +50,7 @@ Exit evidence: generated histories preserve the specified identities and produce
 
 Compile definitions into private stream-table graphs and integrate capability negotiation, member and graph contract digests, durable `EXTERNAL` orchestration, and supported lifecycle operations. This release depends on a usable `external_graph_refresh` major 1 contract from `pg_trickle`; private catalogs or provisional internal APIs must not be used as substitutes.
 
-As of 2026-09-02, the latest `pg_trickle` release is v0.91.0. Its roadmap places backup, restore, upgrade, and clone correctness in v0.92.0, graph contracts and external ownership in v0.93.0, and strict transactional graph refresh in v0.94.0; all three are planned, sequential, large releases without committed dates. Work through v0.7 can continue, but v0.8 must not start against an experimental substitute. Once a released capability advertises stable `external_graph_refresh` major 1, begin with a two-week compatibility spike and revise or stop v0.8–v0.11 before committing to their dates.
+As of 2026-09-02, the latest `pg_trickle` release is v0.91.0. Its roadmap places backup, restore, upgrade, and clone correctness in v0.92.0, graph contracts and external ownership in v0.93.0, and strict transactional graph refresh in v0.94.0; all three are planned, sequential, large releases without committed dates. Do not start v0.1 against an experimental substitute. Once a released capability advertises stable `external_graph_refresh` major 1, run a two-week compatibility spike before v0.1 and revise or stop the roadmap before committing to dates.
 
 ### v0.9 — Transactional refresh (6–9 person-weeks)
 
@@ -72,4 +72,4 @@ V1.0 freezes the public compatibility contract only after every V1 acceptance cr
 
 The milestone ranges total 65–98 engineering person-weeks before cross-cutting rework. Because there is no implementation evidence and the critical integration API does not yet exist, use an initial funding envelope of 90–150 person-weeks rather than a single target. For one engineer sustaining 40–45 project weeks per year, that is roughly 24–45 calendar months after implementation starts. Upstream waiting time and unrelated maintenance extend that range.
 
-Work through v0.7 can proceed independently of the final `pg_trickle` extension points; v0.8 through v1.0 remain gated by their stable implementation and conformance behavior. If upstream delivery is delayed, continue the resolver and its reference tests rather than building a temporary integration layer. Publish a calendar forecast only after v0.2 establishes delivery velocity, and replace it after the post-v0.7 compatibility spike.
+All implementation waits for the stable `pg_trickle` extension contract. If upstream delivery is delayed, keep the design current rather than building code or a temporary integration layer. After the compatibility spike, deliver v0.1 through v0.11 in order with a separate reviewed change for each release. Publish a calendar forecast only after v0.2 establishes measured coding-agent delivery velocity.
