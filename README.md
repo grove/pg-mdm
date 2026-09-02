@@ -51,6 +51,7 @@ Read the design documents for the normative details:
 
 - [DESIGN_V1.md](DESIGN_V1.md) defines the proposed first open-source release, including its SQL model, algorithms, invariants, security boundary, and acceptance criteria.
 - [DESIGN_V2.md](DESIGN_V2.md) describes the post-V1 roadmap for richer source contracts, stewardship, history, integration, checkpointed MDM execution, and shared operations.
+- [ROADMAP.md](ROADMAP.md) divides the V1 implementation into small development releases and defines the V1.0 release gate.
 
 ## Contributing
 
